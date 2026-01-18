@@ -43,7 +43,7 @@ pip install databricks-sql-connector requests
 **Do not hard-code or commit your token.** Use environment variables.
 
 ```powershell
-$env:DATABRICKS_HOST = "dbc-883f179f-7886.cloud.databricks.com"
+$env:DATABRICKS_HOST = "<SERVER>"
 $env:DATABRICKS_TOKEN = "<YOUR_PAT>"
 ```
 
@@ -85,6 +85,54 @@ Notes:
 - `--merge` loads each SQLite table into a staging table named `__stg_<table>` and then merges into the target.
 - When `--merge` is used, `--truncate` is ignored.
 
+### Fast load option: COPY INTO (recommended for speed)
+
+If `--truncate`/`--merge` loads are too slow, use `--copy-into`.
+
+This mode:
+1. Exports each SQLite table to a file locally (for COPY INTO, the script uses **tab-delimited** files **without headers** to safely handle JSON/text columns)
+2. Stages/uploads the files to a Databricks filesystem path (DBFS *or* Unity Catalog Volumes)
+3. Executes `COPY INTO` into Delta tables via the SQL Warehouse
+
+Notes:
+- Empty SQLite tables are skipped automatically in COPY INTO mode.
+- Use `--recreate-tables` if you previously created tables with an incompatible schema.
+
+#### Recommended for Unity Catalog Volumes: stage via Databricks CLI
+
+If your workspace restricts DBFS REST (common), use `--stage-method databricks-cli` and point `--stage-dir` at your Volume.
+
+Example (your managed Volume):
+
+```powershell
+python etl_sqlite_to_databricks.py --db ohlc.sqlite3 --catalog workspace --schema squeeze \
+  --copy-into --truncate --recreate-tables \
+  --stage-method databricks-cli \
+  --stage-dir "dbfs:/Volumes/workspace/squeeze/squeeze_bronze"
+```
+
+#### Default staging (DBFS FileStore)
+
+If DBFS REST is permitted in your workspace, you can stage under FileStore (default):
+
+```powershell
+python etl_sqlite_to_databricks.py --db ohlc.sqlite3 --schema squeeze --copy-into --truncate
+```
+
+Optional: customize staging directory:
+
+```powershell
+python etl_sqlite_to_databricks.py --db ohlc.sqlite3 --schema squeeze --copy-into --truncate --stage-dir "dbfs:/FileStore/squeeze_etl"
+```
+
+#### Export-only (no Databricks)
+
+To just export CSVs locally:
+
+```powershell
+python etl_sqlite_to_databricks.py --db ohlc.sqlite3 --export-only --export-csv-dir .\export_csv
+```
+
 ### Optional: Specify catalog and/or warehouse http_path
 Attempt to use a catalog (falls back automatically if UC isn’t enabled):
 
@@ -110,3 +158,4 @@ python etl_sqlite_to_databricks.py --db ohlc.sqlite3 --schema squeeze --tables o
 - The current load strategy uses batched `INSERT` operations. This is fine for the current dataset size (tens of thousands of rows), but for millions of rows you’ll likely want a faster staged approach (e.g., write Parquet, upload to DBFS/Volumes, `COPY INTO`).
 - Delta tables can occasionally throw transient concurrency errors (e.g., `[DELTA_METADATA_CHANGED]`) if another process updates table metadata during a load. The script retries these automatically.
 - If you run without `--truncate`, the script **appends** to existing tables.
+
