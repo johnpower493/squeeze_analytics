@@ -2,23 +2,120 @@
 
 ## SQLite → Databricks (Free Edition) ETL
 
+## Local analytics tools (quick sanity checks)
+
+This repo also includes small CLI tools for inspecting the SQLite DB and validating trading-plan inputs before running Databricks backtests.
+
+### 1) `analyze_db.py` (schema + samples + basic numeric stats)
+
+```powershell
+python analyze_db.py ohlc.sqlite3
+python analyze_db.py ohlc.sqlite3 --tables trade_plans --sample-rows 3
+python analyze_db.py ohlc.sqlite3 --no-numeric-stats
+```
+
+### 2) `comprehensive_analysis.py` (higher-level summaries)
+
+```powershell
+# Full report (alerts, ohlc, snapshots if present, market caps, trade plans)
+python comprehensive_analysis.py ohlc.sqlite3
+
+# Trade-plan focused (useful when trade_plans drive research/backtests)
+python comprehensive_analysis.py ohlc.sqlite3 --trade-plans-only
+
+# Tune section sizes
+python comprehensive_analysis.py ohlc.sqlite3 --alerts-limit 50 --ohlc-limit 10 --snapshots-limit 2 --market-cap-limit 10
+```
+
+**Note on snapshots:** some DB versions include `snapshot_cache`, others don’t. The script will automatically skip snapshot analysis if the table is missing.
+
+### 3) `detailed_analysis.py` (deep-dive on a single market snapshot)
+
+This analyzes one `snapshot_cache.snapshot_json` payload (when `snapshot_cache` exists):
+
+```powershell
+python detailed_analysis.py ohlc.sqlite3 --latest
+python detailed_analysis.py ohlc.sqlite3 --exchange binance --latest
+```
+
+If `snapshot_cache` is not present in the DB file, the script exits with a clear message.
+
+### 4) `trade_plans_quality.py` (data quality gate for entry_price-based backtests)
+
+Since your swing backtests use **`entry_price` fill logic**, the most important hygiene checks are:
+- stop loss is on the correct side of entry
+- take-profits are on the correct side of entry
+- non-zero risk (`entry_price != stop_loss`)
+- sanity checks on RR / ATR multipliers
+
+Run the report:
+
+```powershell
+# All rows
+python trade_plans_quality.py ohlc.sqlite3
+
+# Last N plans (by ts)
+python trade_plans_quality.py ohlc.sqlite3 --limit 5000
+
+# Customize outlier thresholds
+python trade_plans_quality.py ohlc.sqlite3 --max-rr 25 --max-atr-mult 20
+```
+
+
 This repo contains a local SQLite database (`ohlc.sqlite3`) and an ETL script (`etl_sqlite_to_databricks.py`) that loads the SQLite tables into your Databricks Free Edition environment via a Databricks SQL Warehouse.
 
 ### What’s in `ohlc.sqlite3`
-The SQLite DB contains these tables (row counts from the current file):
+The SQLite DB contains these tables (row counts from the current file; may differ between DB versions):
 
 | table | rows | notes |
 |---|---:|---|
 | `ohlc` | 57,368 | OHLC candles: exchange/symbol/interval + open/close times + OHLCV |
-| `alerts` | 17,031 | alert records; includes JSON fields stored as TEXT |
-| `trade_plans` | 17,031 | trading plans; includes JSON fields stored as TEXT |
+| `alerts` | 93,123 | alert records; includes JSON fields stored as TEXT |
+| `trade_plans` | 93,123 | trading plans; includes JSON fields stored as TEXT |
 | `market_cap_cache` | 237 | cached market cap responses |
-| `snapshot_cache` | 2 | cached market snapshots |
+| `snapshot_cache` | varies | cached market snapshots (not present in all DB versions) |
 | `analysis_runs` | 0 | empty in current file |
 | `backtest_results` | 0 | empty in current file |
 | `backtest_trades` | 0 | empty in current file |
 
 ### What the ETL script creates in Databricks
+
+### Databricks backtesting (trade_plans → backtest_trades/results)
+
+This repo includes a Databricks/PySpark module `databricks_trade_plans_backtest.py` that can be run in a Databricks notebook after loading the SQLite tables to Delta.
+
+**What it does (v1):**
+- Uses `trade_plans.entry_price` as a limit-style entry fill (first candle where `low <= entry_price <= high`)
+- Resolves against `tp1` and `stop_loss` (conservative intrabar default: stop wins if both hit same candle)
+- Computes `r_multiple`, `mae_r`, `mfe_r`, `bars_to_resolve`
+- Writes:
+  - `<schema>.backtest_trades`
+  - `<schema>.backtest_results`
+
+**Run in a Databricks notebook:**
+
+```python
+from databricks_trade_plans_backtest import BacktestConfig, write_backtest_tables
+
+cfg = BacktestConfig(
+    schema="squeeze",              # change to your schema
+    strategy_version="v1_entry_price_tp1",
+    window_days=30,
+    intrabar_priority="stop_first",  # or "tp_first"
+)
+
+# mode can be "append" or "overwrite"
+write_backtest_tables(spark, cfg, mode="append")
+```
+
+Tip: start with a filter while validating:
+
+```python
+cfg = BacktestConfig(schema="squeeze", window_days=30, exchange="bybit", symbol="BTCUSDT")
+write_backtest_tables(spark, cfg, mode="overwrite")
+```
+
+
 `etl_sqlite_to_databricks.py` will:
 
 1. Discover a SQL Warehouse `http_path` via the Databricks REST API (**or** use `DBX_HTTP_PATH` if you set it).
@@ -105,9 +202,9 @@ If your workspace restricts DBFS REST (common), use `--stage-method databricks-c
 Example (your managed Volume):
 
 ```powershell
-python etl_sqlite_to_databricks.py --db ohlc.sqlite3 --catalog workspace --schema squeeze \
-  --copy-into --truncate --recreate-tables \
-  --stage-method databricks-cli \
+python etl_sqlite_to_databricks.py --db ohlc.sqlite3 --catalog workspace --schema squeeze `
+  --copy-into --truncate --recreate-tables `
+  --stage-method databricks-cli `
   --stage-dir "dbfs:/Volumes/workspace/squeeze/squeeze_bronze"
 ```
 

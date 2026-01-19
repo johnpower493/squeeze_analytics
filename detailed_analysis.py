@@ -1,196 +1,271 @@
-import sqlite3
-import pandas as pd
+import argparse
 import json
+import sqlite3
 from collections import Counter
+from datetime import datetime
 
-print("=" * 70)
-print("DETAILED CRYPTO DATABASE ANALYSIS")
-print("=" * 70)
+import pandas as pd
 
-conn = sqlite3.connect('ohlc.sqlite3')
 
-# Parse JSON data from market_data table
-cursor = conn.cursor()
-cursor.execute("SELECT data FROM market_data")
-raw_data = cursor.fetchone()
-
-# Parse JSON and create dataframe
-if raw_data and raw_data[0]:
+def _safe_json_loads(s: str):
     try:
-        # The data is stored as a JSON array
-        data = json.loads(raw_data[0])
-        df = pd.DataFrame(data)
-    except Exception as e:
-        print(f"Error parsing JSON: {e}")
-        df = pd.DataFrame()
-else:
-    df = pd.DataFrame()
+        return json.loads(s)
+    except Exception:
+        return None
 
-print(f"\nTotal crypto pairs tracked: {len(df)}")
-print(f"Data timestamp: {pd.to_datetime(df['ts'].iloc[0], unit='ms')}")
 
-# Exchange distribution
-print("\n" + "=" * 70)
-print("EXCHANGE DISTRIBUTION")
-print("=" * 70)
-print(df['exchange'].value_counts().to_string())
+def _print_header(title: str, width: int = 70) -> None:
+    print("\n" + "=" * width)
+    print(title)
+    print("=" * width)
 
-# Market Cap Analysis
-print("\n" + "=" * 70)
-print("MARKET CAP ANALYSIS (Top 20)")
-print("=" * 70)
-market_cap_df = df[df['market_cap'].notna()].sort_values('market_cap', ascending=False)
-for idx, row in market_cap_df.head(20).iterrows():
-    mc_billion = row['market_cap'] / 1e9
-    print(f"{row['symbol']:15s} ${mc_billion:12,.2f}B  {row.get('sector_tags', 'N/A')}")
 
-# Liquidity Analysis
-print("\n" + "=" * 70)
-print("LIQUIDITY ANALYSIS")
-print("=" * 70)
-liquidity_df = df[df['liquidity_top200'] == True].sort_values('liquidity_rank')
-print(f"Total pairs in top 200 by liquidity: {len(liquidity_df)}")
-print("\nTop 20 by liquidity rank:")
-for idx, row in liquidity_df.head(20).iterrows():
-    print(f"{row['symbol']:15s}  Rank: {row['liquidity_rank']:3d}  MC: ${row['market_cap']/1e9:10.2f}B")
+def load_snapshot(conn: sqlite3.Connection, exchange: str | None, latest: bool) -> tuple[str, int, pd.DataFrame]:
+    tables = set(pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table'", conn)["name"].tolist())
+    if "snapshot_cache" not in tables:
+        raise SystemExit("Table 'snapshot_cache' not found in this DB. Cannot run snapshot analysis.")
 
-# Signal Strength Distribution
-print("\n" + "=" * 70)
-print("SIGNAL STRENGTH DISTRIBUTION")
-print("=" * 70)
-signal_counts = df['signal_strength'].value_counts()
-print(signal_counts.to_string())
+    if latest:
+        if exchange:
+            row = pd.read_sql_query(
+                "SELECT exchange, ts, snapshot_json FROM snapshot_cache WHERE exchange = ? ORDER BY ts DESC LIMIT 1",
+                conn,
+                params=(exchange,),
+            )
+        else:
+            row = pd.read_sql_query(
+                "SELECT exchange, ts, snapshot_json FROM snapshot_cache ORDER BY ts DESC LIMIT 1",
+                conn,
+            )
+    else:
+        # oldest snapshot can be useful for diffing when you have many
+        if exchange:
+            row = pd.read_sql_query(
+                "SELECT exchange, ts, snapshot_json FROM snapshot_cache WHERE exchange = ? ORDER BY ts ASC LIMIT 1",
+                conn,
+                params=(exchange,),
+            )
+        else:
+            row = pd.read_sql_query(
+                "SELECT exchange, ts, snapshot_json FROM snapshot_cache ORDER BY ts ASC LIMIT 1",
+                conn,
+            )
 
-# Multi-timeframe Analysis
-print("\n" + "=" * 70)
-print("MULTI-TIMEFRAME (MTF) SUMMARY")
-print("=" * 70)
-mtf_counts = df['mtf_summary'].value_counts()
-print(mtf_counts.to_string())
+    if row.empty:
+        raise SystemExit("No snapshot_cache rows found (or exchange not present).")
 
-# Sector Tags Analysis
-print("\n" + "=" * 70)
-print("SECTOR TAGS ANALYSIS")
-print("=" * 70)
-all_sectors = []
-for sectors in df['sector_tags'].dropna():
-    all_sectors.extend(sectors)
-sector_counts = Counter(all_sectors)
-print("\nMost common sectors:")
-for sector, count in sector_counts.most_common(20):
-    print(f"{sector:30s}: {count:3d}")
+    ex = row["exchange"].iloc[0]
+    ts = int(row["ts"].iloc[0])
+    payload = row["snapshot_json"].iloc[0]
 
-# Technical Indicators Statistics
-print("\n" + "=" * 70)
-print("TECHNICAL INDICATORS STATISTICS")
-print("=" * 70)
+    data = _safe_json_loads(payload)
+    if not isinstance(data, list):
+        raise SystemExit("snapshot_json is not a JSON array; cannot analyze")
 
-indicators = ['rsi_14', 'rsi_1h', 'rsi_4h', 'rsi_1d', 'macd', 'macd_1h', 'macd_4h', 'macd_1d']
-for indicator in indicators:
-    if indicator in df.columns and df[indicator].notna().sum() > 0:
-        valid_data = df[indicator].dropna()
-        print(f"\n{indicator}:")
-        print(f"  Min: {valid_data.min():.4f}")
-        print(f"  Max: {valid_data.max():.4f}")
-        print(f"  Mean: {valid_data.mean():.4f}")
-        print(f"  Median: {valid_data.median():.4f}")
+    df = pd.DataFrame(data)
+    return ex, ts, df
 
-# Momentum Analysis
-print("\n" + "=" * 70)
-print("MOMENTUM ANALYSIS")
-print("=" * 70)
-momentum_cols = ['momentum_score', 'impulse_score', 'signal_score']
-for col in momentum_cols:
-    if col in df.columns:
-        print(f"\n{col}:")
-        print(f"  Min: {df[col].min():.4f}")
-        print(f"  Max: {df[col].max():.4f}")
-        print(f"  Mean: {df[col].mean():.4f}")
 
-# Price Changes Analysis
-print("\n" + "=" * 70)
-print("PRICE CHANGES ANALYSIS")
-print("=" * 70)
-change_cols = ['change_1m', 'change_5m', 'change_15m', 'change_60m']
-for col in change_cols:
-    if col in df.columns:
-        print(f"\n{col}:")
-        valid = df[col].dropna()
-        print(f"  Min: {valid.min()*100:.4f}%")
-        print(f"  Max: {valid.max()*100:.4f}%")
-        print(f"  Mean: {valid.mean()*100:.4f}%")
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Detailed snapshot_cache analysis.")
+    ap.add_argument("db", nargs="?", default="ohlc.sqlite3", help="Path to SQLite DB")
+    ap.add_argument("--exchange", default=None, help="Filter snapshots by exchange")
+    ap.add_argument(
+        "--latest",
+        action="store_true",
+        help="Analyze latest snapshot (default: oldest; useful once you have many snapshots)",
+    )
+    args = ap.parse_args()
 
-# Top Gainers and Losers (15m)
-print("\n" + "=" * 70)
-print("TOP GAINERS AND LOSERS (15 minutes)")
-print("=" * 70)
-df_sorted = df.sort_values('change_15m', ascending=False)
-print("\nTop 10 Gainers:")
-for idx, row in df_sorted.head(10).iterrows():
-    change_pct = row['change_15m'] * 100
-    print(f"{row['symbol']:15s}  {change_pct:+.4f}%  Price: ${row['last_price']:.4f}")
-
-print("\nTop 10 Losers:")
-for idx, row in df_sorted.tail(10).iterrows():
-    change_pct = row['change_15m'] * 100
-    print(f"{row['symbol']:15s}  {change_pct:+.4f}%  Price: ${row['last_price']:.4f}")
-
-# Volatility Analysis
-print("\n" + "=" * 70)
-print("VOLATILITY ANALYSIS")
-print("=" * 70)
-print(f"\nVolatility Percentile Distribution:")
-vol_dist = df['volatility_percentile'].describe()
-print(vol_dist.to_string())
-
-# Volume Analysis
-print("\n" + "=" * 70)
-print("VOLUME ANALYSIS")
-print("=" * 70)
-volume_cols = ['vol_1m', 'vol_5m', 'vol_15m', 'rvol_1m']
-for col in volume_cols:
-    if col in df.columns:
-        valid = df[col].dropna()
-        if len(valid) > 0:
-            print(f"\n{col}:")
-            print(f"  Min: {valid.min():,.2f}")
-            print(f"  Max: {valid.max():,.2f}")
-            print(f"  Mean: {valid.mean():,.2f}")
-
-# Top 10 by Volume (15m)
-print("\n" + "=" * 70)
-print("TOP 10 BY VOLUME (15 minutes)")
-print("=" * 70)
-df_sorted_vol = df.sort_values('vol_15m', ascending=False)
-for idx, row in df_sorted_vol.head(10).iterrows():
-    print(f"{row['symbol']:15s}  Vol: {row['vol_15m']:15,.2f}  Price: ${row['last_price']:8.4f}")
-
-# Open Interest Analysis
-print("\n" + "=" * 70)
-print("OPEN INTEREST ANALYSIS")
-print("=" * 70)
-oi_valid = df[df['open_interest'].notna()]
-if len(oi_valid) > 0:
-    print(f"\nTop 10 by Open Interest:")
-    oi_sorted = oi_valid.sort_values('open_interest', ascending=False)
-    for idx, row in oi_sorted.head(10).iterrows():
-        oi_millions = row['open_interest'] / 1e6
-        print(f"{row['symbol']:15s}  OI: ${oi_millions:10.2f}M  Price: ${row['last_price']:8.4f}")
-
-# Funding Rate Analysis (if available)
-funding_df = df[df['funding_rate'].notna()]
-if len(funding_df) > 0:
-    print("\n" + "=" * 70)
-    print("FUNDING RATE ANALYSIS")
     print("=" * 70)
-    print(f"Pairs with funding data: {len(funding_df)}")
-    print(f"\nFunding Rate:")
-    print(f"  Min: {funding_df['funding_rate'].min()*100:.4f}%")
-    print(f"  Max: {funding_df['funding_rate'].max()*100:.4f}%")
-    print(f"  Mean: {funding_df['funding_rate'].mean()*100:.4f}%")
+    print("DETAILED CRYPTO DATABASE ANALYSIS")
+    print("=" * 70)
+    print(f"DB: {args.db}")
 
-conn.close()
+    conn = sqlite3.connect(args.db)
+    try:
+        exchange, ts, df = load_snapshot(conn, args.exchange, latest=args.latest)
+    finally:
+        conn.close()
 
-print("\n" + "=" * 70)
-print("ANALYSIS COMPLETE")
-print("=" * 70)
+    print(f"\nSnapshot exchange: {exchange}")
+    print(f"Snapshot timestamp: {datetime.fromtimestamp(ts / 1000)}")
+    print(f"Total crypto pairs tracked: {len(df)}")
+
+    if df.empty:
+        print("No rows in snapshot payload.")
+        return
+
+    _print_header("EXCHANGE DISTRIBUTION")
+    if "exchange" in df.columns:
+        print(df["exchange"].value_counts().to_string())
+    else:
+        print("(missing column: exchange)")
+
+    _print_header("MARKET CAP ANALYSIS (Top 20)")
+    if "market_cap" in df.columns:
+        market_cap_df = df[pd.to_numeric(df["market_cap"], errors="coerce").notna()].copy()
+        market_cap_df["market_cap"] = pd.to_numeric(market_cap_df["market_cap"], errors="coerce")
+        market_cap_df = market_cap_df.sort_values("market_cap", ascending=False)
+        for _, row in market_cap_df.head(20).iterrows():
+            mc_billion = float(row["market_cap"]) / 1e9
+            print(f"{str(row.get('symbol','')):15s} ${mc_billion:12,.2f}B")
+    else:
+        print("(missing column: market_cap)")
+
+    _print_header("LIQUIDITY ANALYSIS")
+    if "liquidity_top200" in df.columns and "liquidity_rank" in df.columns:
+        tmp = df.copy()
+        tmp["liquidity_rank"] = pd.to_numeric(tmp["liquidity_rank"], errors="coerce")
+        liquidity_df = tmp[tmp["liquidity_top200"] == True].sort_values("liquidity_rank")
+        print(f"Total pairs in top 200 by liquidity: {len(liquidity_df)}")
+        print("\nTop 20 by liquidity rank:")
+        for _, row in liquidity_df.head(20).iterrows():
+            mc = row.get("market_cap")
+            mc_b = float(mc) / 1e9 if mc is not None else float('nan')
+            print(f"{str(row.get('symbol','')):15s}  Rank: {int(row['liquidity_rank']) if pd.notna(row['liquidity_rank']) else -1:3d}  MC: ${mc_b:10.2f}B")
+    else:
+        print("(missing columns: liquidity_top200/liquidity_rank)")
+
+    _print_header("SIGNAL STRENGTH DISTRIBUTION")
+    if "signal_strength" in df.columns:
+        print(df["signal_strength"].value_counts(dropna=False).to_string())
+    else:
+        print("(missing column: signal_strength)")
+
+    _print_header("MULTI-TIMEFRAME (MTF) SUMMARY")
+    if "mtf_summary" in df.columns:
+        print(df["mtf_summary"].value_counts(dropna=False).to_string())
+    else:
+        print("(missing column: mtf_summary)")
+
+    _print_header("SECTOR TAGS ANALYSIS")
+    if "sector_tags" in df.columns:
+        all_sectors: list[str] = []
+        for sectors in df["sector_tags"].dropna():
+            if isinstance(sectors, list):
+                all_sectors.extend([str(s) for s in sectors])
+        sector_counts = Counter(all_sectors)
+        if sector_counts:
+            print("\nMost common sectors:")
+            for sector, count in sector_counts.most_common(20):
+                print(f"{sector:30s}: {count:3d}")
+        else:
+            print("No sector tags in snapshot.")
+    else:
+        print("(missing column: sector_tags)")
+
+    _print_header("TECHNICAL INDICATORS STATISTICS")
+    indicators = ["rsi_14", "rsi_1h", "rsi_4h", "rsi_1d", "macd", "macd_1h", "macd_4h", "macd_1d"]
+    for indicator in indicators:
+        if indicator in df.columns:
+            valid_data = pd.to_numeric(df[indicator], errors="coerce").dropna()
+            if len(valid_data) > 0:
+                print(f"\n{indicator}:")
+                print(f"  Min: {valid_data.min():.4f}")
+                print(f"  Max: {valid_data.max():.4f}")
+                print(f"  Mean: {valid_data.mean():.4f}")
+                print(f"  Median: {valid_data.median():.4f}")
+
+    _print_header("MOMENTUM ANALYSIS")
+    for col in ["momentum_score", "impulse_score", "signal_score"]:
+        if col in df.columns:
+            v = pd.to_numeric(df[col], errors="coerce")
+            if v.notna().any():
+                print(f"\n{col}:")
+                print(f"  Min: {v.min():.4f}")
+                print(f"  Max: {v.max():.4f}")
+                print(f"  Mean: {v.mean():.4f}")
+
+    _print_header("PRICE CHANGES ANALYSIS")
+    for col in ["change_1m", "change_5m", "change_15m", "change_60m"]:
+        if col in df.columns:
+            valid = pd.to_numeric(df[col], errors="coerce").dropna()
+            if len(valid) > 0:
+                print(f"\n{col}:")
+                print(f"  Min: {valid.min()*100:.4f}%")
+                print(f"  Max: {valid.max()*100:.4f}%")
+                print(f"  Mean: {valid.mean()*100:.4f}%")
+
+    if "change_15m" in df.columns:
+        _print_header("TOP GAINERS AND LOSERS (15 minutes)")
+        df_sorted = df.copy()
+        df_sorted["change_15m"] = pd.to_numeric(df_sorted["change_15m"], errors="coerce")
+        df_sorted = df_sorted.sort_values("change_15m", ascending=False)
+
+        print("\nTop 10 Gainers:")
+        for _, row in df_sorted.head(10).iterrows():
+            change_pct = float(row["change_15m"]) * 100 if pd.notna(row["change_15m"]) else float('nan')
+            lp = row.get("last_price")
+            lp_str = f"${float(lp):.4f}" if lp is not None else "N/A"
+            print(f"{str(row.get('symbol','')):15s}  {change_pct:+.4f}%  Price: {lp_str}")
+
+        print("\nTop 10 Losers:")
+        for _, row in df_sorted.tail(10).iterrows():
+            change_pct = float(row["change_15m"]) * 100 if pd.notna(row["change_15m"]) else float('nan')
+            lp = row.get("last_price")
+            lp_str = f"${float(lp):.4f}" if lp is not None else "N/A"
+            print(f"{str(row.get('symbol','')):15s}  {change_pct:+.4f}%  Price: {lp_str}")
+
+    _print_header("VOLATILITY ANALYSIS")
+    if "volatility_percentile" in df.columns:
+        vol_dist = pd.to_numeric(df["volatility_percentile"], errors="coerce").describe()
+        print(vol_dist.to_string())
+    else:
+        print("(missing column: volatility_percentile)")
+
+    _print_header("VOLUME ANALYSIS")
+    for col in ["vol_1m", "vol_5m", "vol_15m", "rvol_1m"]:
+        if col in df.columns:
+            valid = pd.to_numeric(df[col], errors="coerce").dropna()
+            if len(valid) > 0:
+                print(f"\n{col}:")
+                print(f"  Min: {valid.min():,.2f}")
+                print(f"  Max: {valid.max():,.2f}")
+                print(f"  Mean: {valid.mean():,.2f}")
+
+    if "vol_15m" in df.columns:
+        _print_header("TOP 10 BY VOLUME (15 minutes)")
+        df_sorted_vol = df.copy()
+        df_sorted_vol["vol_15m"] = pd.to_numeric(df_sorted_vol["vol_15m"], errors="coerce")
+        df_sorted_vol = df_sorted_vol.sort_values("vol_15m", ascending=False)
+        for _, row in df_sorted_vol.head(10).iterrows():
+            lp = row.get("last_price")
+            lp_str = f"${float(lp):.4f}" if lp is not None else "N/A"
+            print(f"{str(row.get('symbol','')):15s}  Vol: {float(row['vol_15m']):15,.2f}  Price: {lp_str}")
+
+    _print_header("OPEN INTEREST ANALYSIS")
+    if "open_interest" in df.columns:
+        oi_valid = df[pd.to_numeric(df["open_interest"], errors="coerce").notna()].copy()
+        oi_valid["open_interest"] = pd.to_numeric(oi_valid["open_interest"], errors="coerce")
+        if len(oi_valid) > 0:
+            print("\nTop 10 by Open Interest:")
+            oi_sorted = oi_valid.sort_values("open_interest", ascending=False).head(10)
+            for _, row in oi_sorted.iterrows():
+                oi_millions = float(row["open_interest"]) / 1e6
+                lp = row.get("last_price")
+                lp_str = f"${float(lp):.4f}" if lp is not None else "N/A"
+                print(f"{str(row.get('symbol','')):15s}  OI: ${oi_millions:10.2f}M  Price: {lp_str}")
+        else:
+            print("No open interest values in snapshot.")
+    else:
+        print("(missing column: open_interest)")
+
+    if "funding_rate" in df.columns:
+        funding_df = df[pd.to_numeric(df["funding_rate"], errors="coerce").notna()].copy()
+        funding_df["funding_rate"] = pd.to_numeric(funding_df["funding_rate"], errors="coerce")
+        if len(funding_df) > 0:
+            _print_header("FUNDING RATE ANALYSIS")
+            print(f"Pairs with funding data: {len(funding_df)}")
+            print("\nFunding Rate:")
+            print(f"  Min: {funding_df['funding_rate'].min()*100:.4f}%")
+            print(f"  Max: {funding_df['funding_rate'].max()*100:.4f}%")
+            print(f"  Mean: {funding_df['funding_rate'].mean()*100:.4f}%")
+
+    print("\n" + "=" * 70)
+    print("ANALYSIS COMPLETE")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
