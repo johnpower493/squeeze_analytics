@@ -1,2 +1,2 @@
 ohlc.sqlite3
-data/
+.\data\*
