@@ -14,6 +14,59 @@ def _safe_json_loads(s: str):
         return None
 
 
+def _coerce_snapshot_to_rows(obj):
+    """Return a list-of-dict rows from snapshot_json.
+
+    Supports:
+      - A JSON array payload: [ {...}, {...} ]
+      - A JSON object wrapper that contains an embedded array under a common key
+        (e.g. {"data": [...]}, {"result": [...]}, etc.).
+
+    Returns None if it can't find a list-like payload.
+    """
+    if isinstance(obj, list):
+        return obj
+
+    if not isinstance(obj, dict):
+        return None
+
+    # Common wrapper keys from APIs
+    candidate_keys = (
+        "data",
+        "result",
+        "results",
+        "items",
+        "payload",
+        "snapshot",
+        "markets",
+        "coins",
+        "pairs",
+        "rows",
+        "assets",
+    )
+    for k in candidate_keys:
+        v = obj.get(k)
+        if isinstance(v, list):
+            return v
+        # sometimes nested like {data: {items: [...]}}
+        if isinstance(v, dict):
+            for kk in candidate_keys:
+                vv = v.get(kk)
+                if isinstance(vv, list):
+                    return vv
+
+    # Fallback: first list value that looks like rows
+    for v in obj.values():
+        if isinstance(v, list):
+            return v
+        if isinstance(v, dict):
+            for vv in v.values():
+                if isinstance(vv, list):
+                    return vv
+
+    return None
+
+
 def _print_header(title: str, width: int = 70) -> None:
     print("\n" + "=" * width)
     print(title)
@@ -59,10 +112,16 @@ def load_snapshot(conn: sqlite3.Connection, exchange: str | None, latest: bool) 
     payload = row["snapshot_json"].iloc[0]
 
     data = _safe_json_loads(payload)
-    if not isinstance(data, list):
-        raise SystemExit("snapshot_json is not a JSON array; cannot analyze")
+    rows = _coerce_snapshot_to_rows(data)
+    if not isinstance(rows, list):
+        top = type(data).__name__
+        keys = list(data.keys())[:30] if isinstance(data, dict) else None
+        raise SystemExit(
+            "snapshot_json did not contain a list payload that this script can analyze. "
+            f"Top-level type={top}" + (f", keys={keys}" if keys else "")
+        )
 
-    df = pd.DataFrame(data)
+    df = pd.DataFrame(rows)
     return ex, ts, df
 
 

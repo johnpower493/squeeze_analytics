@@ -20,6 +20,57 @@ def _safe_json_loads(s: str):
         return None
 
 
+def _coerce_snapshot_to_rows(obj):
+    """Return a list-of-dict rows from snapshot_json.
+
+    Supports:
+      - A JSON array payload: [ {...}, {...} ]
+      - A JSON object wrapper that contains an embedded array under a common key
+        (e.g. {"data": [...]}, {"result": [...]}, etc.).
+
+    Returns None if it can't find a list-like payload.
+    """
+    if isinstance(obj, list):
+        return obj
+
+    if not isinstance(obj, dict):
+        return None
+
+    candidate_keys = (
+        "data",
+        "result",
+        "results",
+        "items",
+        "payload",
+        "snapshot",
+        "markets",
+        "coins",
+        "pairs",
+        "rows",
+        "assets",
+    )
+
+    for k in candidate_keys:
+        v = obj.get(k)
+        if isinstance(v, list):
+            return v
+        if isinstance(v, dict):
+            for kk in candidate_keys:
+                vv = v.get(kk)
+                if isinstance(vv, list):
+                    return vv
+
+    for v in obj.values():
+        if isinstance(v, list):
+            return v
+        if isinstance(v, dict):
+            for vv in v.values():
+                if isinstance(vv, list):
+                    return vv
+
+    return None
+
+
 def analyze_alerts(conn: sqlite3.Connection, limit: int) -> None:
     _print_header("1. ALERTS TABLE ANALYSIS")
 
@@ -124,12 +175,18 @@ def analyze_snapshots(conn: sqlite3.Connection, limit: int) -> None:
         print(f"\nExchange: {row['exchange']}")
         print(f"Timestamp: {datetime.fromtimestamp(row['ts'] / 1000)}")
 
-        snapshot_data = _safe_json_loads(row["snapshot_json"])
-        if not isinstance(snapshot_data, list):
-            print("Error parsing snapshot: snapshot_json was not a JSON array")
+        snapshot_obj = _safe_json_loads(row["snapshot_json"])
+        rows = _coerce_snapshot_to_rows(snapshot_obj)
+        if not isinstance(rows, list):
+            top = type(snapshot_obj).__name__
+            keys = list(snapshot_obj.keys())[:30] if isinstance(snapshot_obj, dict) else None
+            msg = f"Error parsing snapshot: snapshot_json did not contain an array payload (type={top}" + (
+                f", keys={keys}" if keys else ""
+            ) + ")"
+            print(msg)
             continue
 
-        df = pd.DataFrame(snapshot_data)
+        df = pd.DataFrame(rows)
         print(f"Total pairs in snapshot: {len(df)}")
         if df.empty:
             continue
