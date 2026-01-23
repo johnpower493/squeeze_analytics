@@ -84,6 +84,46 @@ The SQLite DB contains these tables (row counts from the current file; may diffe
 
 This repo includes a Databricks/PySpark module `databricks_trade_plans_backtest.py` that can be run in a Databricks notebook after loading the SQLite tables to Delta.
 
+## Databricks notebooks (recommended workflow)
+
+If you’re running analysis in Databricks, the repo’s “active” notebooks are the `databricks_*.ipynb` notebooks.
+
+Suggested run order:
+
+1. **Load data to Delta**
+   - `copy_into_manual_upload_volume.ipynb` (manual upload volume + `COPY INTO`)
+   - or `etl_sqlite_to_databricks.py` (automated SQLite → Databricks SQL Warehouse)
+
+2. **EDA + data quality + clean universe**
+   - `databricks_eda_sydney_time.ipynb`
+   - Produces: `clean_universe` (filtered `(exchange,symbol,interval)` set with gap/dup/invalid-bar metrics)
+
+3. **Alert → outcome analysis (optional but recommended)**
+   - `databricks_alert_outcomes.ipynb`
+   - Helps quantify which alert types/timeframes are predictive and in which Sydney sessions.
+
+4. **ML dataset + training + scoring (4h, barrier label)**
+   - `databricks_ml_barrier_4h_full_features.ipynb`
+   - Produces:
+     - `ml_barrier_dataset_4h`
+     - `ml_barrier_predictions_4h`
+   - Key knobs:
+     - `TP_ATR`, `SL_ATR`, `W_BARS`
+     - `AMBIGUITY_POLICY` (`tp_first` / `sl_first` / `discard_both`)
+     - `TRAIN_END`, `VALID_END`
+
+5. **Pattern backtest at scale (optionally ML-filtered)**
+   - `databricks_momentum_swing_backtest_starter.ipynb`
+   - Produces:
+     - `backtest_trades`
+     - `backtest_results`
+   - Optional ML filter knobs:
+     - `USE_ML_FILTER`, `ML_THRESHOLD`, `ML_RUN_ID`
+
+## Archived notebooks
+
+Older/local-only notebooks have been moved to `archive/` to keep the repo root focused on Databricks workflows.
+
 **What it does (v1):**
 - Uses `trade_plans.entry_price` as a limit-style entry fill (first candle where `low <= entry_price <= high`)
 - Resolves against `tp1` and `stop_loss` (conservative intrabar default: stop wins if both hit same candle)
