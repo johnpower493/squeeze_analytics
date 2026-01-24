@@ -1,0 +1,516 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © 2026 Locked Range Analysis - Optimized Version
+
+//@version=6
+indicator("Locked Range Analysis (LRA) - Historical", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUT PARAMETERS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Range Detection Settings
+swingLength = input.int(3, "Swing High/Low Length", minval=1, maxval=20, group="Range Detection")
+rangeMinBars = input.int(5, "Minimum Bars in Range", minval=3, maxval=50, group="Range Detection")
+atrMult = input.float(1.5, "ATR Multiple for Range Height", minval=0.5, maxval=5.0, step=0.1, group="Range Detection")
+rangeMaxBars = input.int(100, "Maximum Bars in Range", minval=20, maxval=200, group="Range Detection")
+breakoutThreshold = input.float(0.5, "Breakout Threshold %", minval=0.1, maxval=2.0, step=0.1, group="Range Detection")
+
+// TPSL Level Settings
+tpsl1Method = input.string("Auto", "TPSL 1 Method", options=["Auto", "Range+Height", "Swing"], group="TPSL Levels")
+useTPSL2 = input.bool(true, "Show TPSL 2 Levels", group="TPSL Levels")
+
+// Visual Settings
+showLR = input.bool(true, "Show Locked Ranges", group="Visual")
+showTPSL1 = input.bool(true, "Show TPSL 1 Levels", group="Visual")
+showTPSL2 = input.bool(true, "Show TPSL 2 Levels", group="Visual")
+showImbalance = input.bool(true, "Show Imbalance Arrows", group="Visual")
+maxHistoricalRanges = input.int(10, "Max Historical Ranges to Display", minval=1, maxval=50, group="Visual")
+showBreakoutLabels = input.bool(true, "Show Breakout Labels", group="Visual")
+
+// Color Settings
+colorBuy = input.color(color.new(color.green, 0), "Buy/Bullish Color", group="Colors")
+colorSell = input.color(color.new(color.red, 0), "Sell/Bearish Color", group="Colors")
+colorNeutral = input.color(color.new(color.gray, 0), "Neutral Color", group="Colors")
+historicalTransparency = input.int(85, "Historical Range Transparency", minval=50, maxval=95, group="Colors")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ATR for volatility measurement
+atrVal = ta.atr(14)
+
+// Pivot High/Low detection
+pivotHigh = ta.pivothigh(high, swingLength, swingLength)
+pivotLow = ta.pivotlow(low, swingLength, swingLength)
+
+// Store swing highs and lows
+var float[] swingHighs = array.new_float(100)
+var float[] swingLows = array.new_float(100)
+var int[] swingHighBars = array.new_int(100)
+var int[] swingLowBars = array.new_int(100)
+
+// Update swing arrays
+if not na(pivotHigh)
+    array.unshift(swingHighs, pivotHigh)
+    array.unshift(swingHighBars, bar_index - swingLength)
+    if array.size(swingHighs) > 50
+        array.pop(swingHighs)
+        array.pop(swingHighBars)
+
+if not na(pivotLow)
+    array.unshift(swingLows, pivotLow)
+    array.unshift(swingLowBars, bar_index - swingLength)
+    if array.size(swingLows) > 50
+        array.pop(swingLows)
+        array.pop(swingLowBars)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// HISTORICAL LOCKED RANGE STORAGE
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Historical locked range storage arrays
+var array<float> hist_lrHigh = array.new<float>()
+var array<float> hist_lrLow = array.new<float>()
+var array<int> hist_lrStartBar = array.new<int>()
+var array<int> hist_lrEndBar = array.new<int>()
+var array<string> hist_lrType = array.new<string>()
+var array<float> hist_lrImbalance = array.new<float>()
+var array<box> hist_lrBoxes = array.new<box>()
+var array<label> hist_lrLabels = array.new<label>()
+var array<line> hist_tpsl1LinesHigh = array.new<line>()
+var array<line> hist_tpsl1LinesLow = array.new<line>()
+var array<line> hist_tpsl2LinesHigh = array.new<line>()
+var array<line> hist_tpsl2LinesLow = array.new<line>()
+
+// Function to add a completed locked range to history
+addToHistory(lrH, lrL, startBar, endBar, lrT, lrImb) =>
+    array.push(hist_lrHigh, lrH)
+    array.push(hist_lrLow, lrL)
+    array.push(hist_lrStartBar, startBar)
+    array.push(hist_lrEndBar, endBar)
+    array.push(hist_lrType, lrT)
+    array.push(hist_lrImbalance, lrImb)
+    
+    // Keep only the most recent ranges
+    if array.size(hist_lrHigh) > maxHistoricalRanges
+        array.shift(hist_lrHigh)
+        array.shift(hist_lrLow)
+        array.shift(hist_lrStartBar)
+        array.shift(hist_lrEndBar)
+        array.shift(hist_lrType)
+        array.shift(hist_lrImbalance)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// LOCKED RANGE DETECTION - IMPROVED
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Current range structure (active range)
+var float lrHigh = na
+var float lrLow = na
+var int lrStartBar = na
+var int lrEndBar = na
+var bool lrActive = false
+var string lrType = "Neutral"
+var float lrImbalance = 0.0
+
+// Volume analysis
+volSMA = ta.sma(volume, 20)
+volRatio = volume / volSMA
+
+// Detect range consolidation
+priceRange = high - low
+avgRange = ta.sma(priceRange, 20)
+isNarrowRange = priceRange < avgRange * atrMult
+
+// Range detection variables
+var int rangeBarCount = 0
+var float sumHighInRange = 0.0
+var float sumLowInRange = 0.0
+var int highTouches = 0
+var int lowTouches = 0
+var float currentRangeTop = na
+var float currentRangeBottom = na
+var int currentRangeStart = na
+
+// Flag to trigger cleanup
+var bool clearVisuals = false
+
+// Improved range detection logic
+if not lrActive
+    // Start new range detection
+    if isNarrowRange
+        if na(currentRangeTop)
+            currentRangeTop := high
+            currentRangeBottom := low
+            currentRangeStart := bar_index
+            rangeBarCount := 1
+            highTouches := 0
+            lowTouches := 0
+            sumHighInRange := 0.0
+            sumLowInRange := 0.0
+        else
+            // Expand range
+            currentRangeTop := math.max(currentRangeTop, high)
+            currentRangeBottom := math.min(currentRangeBottom, low)
+            rangeBarCount := rangeBarCount + 1
+            
+            // Count touches
+            touchThreshold = atrVal * 0.15
+            if high >= currentRangeTop - touchThreshold
+                highTouches := highTouches + 1
+                sumHighInRange := sumHighInRange + volume
+            if low <= currentRangeBottom + touchThreshold
+                lowTouches := lowTouches + 1
+                sumLowInRange := sumLowInRange + volume
+        
+        // Check if range is valid
+        if rangeBarCount >= rangeMinBars and (highTouches > 0 or lowTouches > 0)
+            // Determine range type based on volume imbalance
+            buyPressure = sumHighInRange / math.max(highTouches, 1)
+            sellPressure = sumLowInRange / math.max(lowTouches, 1)
+            
+            maxPressure = math.max(buyPressure, sellPressure)
+            lrImbalance := maxPressure > 0 ? (buyPressure - sellPressure) / maxPressure : 0.0
+            
+            // Range type determination
+            if lrImbalance > 0.10
+                lrType := "Resistance"
+            else if lrImbalance < -0.10
+                lrType := "Support"
+            else
+                lrType := "Gravitation"
+            
+            // Activate range
+            lrActive := true
+            lrHigh := currentRangeTop
+            lrLow := currentRangeBottom
+            lrStartBar := currentRangeStart
+            lrEndBar := bar_index
+            
+            // Reset range detection
+            currentRangeTop := na
+            currentRangeBottom := na
+            currentRangeStart := na
+            rangeBarCount := 0
+            sumHighInRange := 0.0
+            sumLowInRange := 0.0
+            highTouches := 0
+            lowTouches := 0
+    else
+        // Reset if range is broken
+        if not isNarrowRange
+            currentRangeTop := na
+            currentRangeBottom := na
+            currentRangeStart := na
+            rangeBarCount := 0
+            sumHighInRange := 0.0
+            sumLowInRange := 0.0
+            highTouches := 0
+            lowTouches := 0
+    
+    // Reset if range has gone on too long
+    if not na(currentRangeStart) and (bar_index - currentRangeStart) > rangeMaxBars
+        currentRangeTop := na
+        currentRangeBottom := na
+        currentRangeStart := na
+        rangeBarCount := 0
+        sumHighInRange := 0.0
+        sumLowInRange := 0.0
+        highTouches := 0
+        lowTouches := 0
+
+// Check for range breakout
+rangeHeightPct = lrActive ? (lrHigh - lrLow) / lrLow * 100 : 0.0
+breakoutAmount = rangeHeightPct * breakoutThreshold / 100
+breakUpConfirm = lrActive and close > lrHigh * (1 + breakoutAmount) and high > lrHigh
+breakDownConfirm = lrActive and close < lrLow * (1 - breakoutAmount) and low < lrLow
+
+bool breakUp = breakUpConfirm
+bool breakDown = breakDownConfirm
+
+// Store to history and clear on breakout
+if breakUp or breakDown
+    if lrActive
+        // Add completed range to history
+        addToHistory(lrHigh, lrLow, lrStartBar, lrEndBar, lrType, lrImbalance)
+    
+    clearVisuals := true
+    lrActive := false
+    lrHigh := na
+    lrLow := na
+    lrStartBar := na
+    lrEndBar := na
+    lrType := "Neutral"
+    lrImbalance := 0.0
+else
+    clearVisuals := false
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TPSL LEVELS CALCULATION
+// ═════════════════════════════════════════════════════════════════════════════
+
+var float prevSwingHigh = na
+var float prevSwingLow = na
+var int prevSwingHighBar = na
+var int prevSwingLowBar = na
+
+if lrActive
+    // Find previous swings before range start
+    for i = 0 to array.size(swingHighs) - 1
+        if array.get(swingHighBars, i) < lrStartBar
+            prevSwingHigh := array.get(swingHighs, i)
+            prevSwingHighBar := array.get(swingHighBars, i)
+            break
+    
+    for i = 0 to array.size(swingLows) - 1
+        if array.get(swingLowBars, i) < lrStartBar
+            prevSwingLow := array.get(swingLows, i)
+            prevSwingLowBar := array.get(swingLowBars, i)
+            break
+
+// TPSL 1 Levels
+float tpsl1High = na
+float tpsl1Low = na
+
+if lrActive
+    rangeHeight = lrHigh - lrLow
+    
+    if tpsl1Method == "Range+Height"
+        tpsl1High := lrHigh + rangeHeight
+        tpsl1Low := lrLow - rangeHeight
+    else if tpsl1Method == "Swing"
+        tpsl1High := not na(prevSwingHigh) ? prevSwingHigh : lrHigh + rangeHeight
+        tpsl1Low := not na(prevSwingLow) ? prevSwingLow : lrLow - rangeHeight
+    else  // Auto
+        tpsl1High := not na(prevSwingHigh) and prevSwingHigh > lrHigh ? prevSwingHigh : lrHigh + rangeHeight
+        tpsl1Low := not na(prevSwingLow) and prevSwingLow < lrLow ? prevSwingLow : lrLow - rangeHeight
+
+// TPSL 2 Levels
+float tpsl2High = na
+float tpsl2Low = na
+
+if lrActive and useTPSL2
+    foundFirstHigh = false
+    for i = 0 to array.size(swingHighs) - 1
+        if not foundFirstHigh and array.get(swingHighBars, i) < prevSwingHighBar
+            foundFirstHigh := true
+        else if foundFirstHigh and array.get(swingHighBars, i) < prevSwingHighBar
+            tpsl2High := array.get(swingHighs, i)
+            break
+    
+    foundFirstLow = false
+    for i = 0 to array.size(swingLows) - 1
+        if not foundFirstLow and array.get(swingLowBars, i) < prevSwingLowBar
+            foundFirstLow := true
+        else if foundFirstLow and array.get(swingLowBars, i) < prevSwingLowBar
+            tpsl2Low := array.get(swingLows, i)
+            break
+
+// ═════════════════════════════════════════════════════════════════════════════
+// HISTORICAL RANGES VISUALIZATION
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Clear old historical boxes and labels
+if barstate.isfirst
+    if array.size(hist_lrBoxes) > 0
+        for i = 0 to array.size(hist_lrBoxes) - 1
+            box.delete(array.get(hist_lrBoxes, i))
+        array.clear(hist_lrBoxes)
+    
+    if array.size(hist_lrLabels) > 0
+        for i = 0 to array.size(hist_lrLabels) - 1
+            label.delete(array.get(hist_lrLabels, i))
+        array.clear(hist_lrLabels)
+    
+    if array.size(hist_tpsl1LinesHigh) > 0
+        for i = 0 to array.size(hist_tpsl1LinesHigh) - 1
+            line.delete(array.get(hist_tpsl1LinesHigh, i))
+        array.clear(hist_tpsl1LinesHigh)
+    
+    if array.size(hist_tpsl1LinesLow) > 0
+        for i = 0 to array.size(hist_tpsl1LinesLow) - 1
+            line.delete(array.get(hist_tpsl1LinesLow, i))
+        array.clear(hist_tpsl1LinesLow)
+
+// Draw historical ranges
+if barstate.islast and showLR
+    for i = 0 to array.size(hist_lrHigh) - 1
+        histHigh = array.get(hist_lrHigh, i)
+        histLow = array.get(hist_lrLow, i)
+        histStart = array.get(hist_lrStartBar, i)
+        histEnd = array.get(hist_lrEndBar, i)
+        histType = array.get(hist_lrType, i)
+        histImb = array.get(hist_lrImbalance, i)
+        
+        histColor = histType == "Resistance" ? colorBuy : histType == "Support" ? colorSell : colorNeutral
+        
+        // Draw historical box
+        histBox = box.new(histStart, histHigh, histEnd, histLow, 
+                         bgcolor=color.new(histColor, historicalTransparency), 
+                         border_color=color.new(histColor, 50), 
+                         border_width=1,
+                         border_style=line.style_dashed)
+        array.push(hist_lrBoxes, histBox)
+        
+        // Draw historical label
+        histLabel = label.new(histStart, histHigh, 
+                             histType + "\n" + str.tostring(histImb * 100, "#.#") + "%", 
+                             color=color.new(histColor, historicalTransparency), 
+                             textcolor=color.new(histColor, 20), 
+                             style=label.style_label_down, 
+                             size=size.tiny)
+        array.push(hist_lrLabels, histLabel)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CURRENT RANGE VISUALIZATION
+// ═════════════════════════════════════════════════════════════════════════════
+
+var box lrBox = na
+var line[] tpsl1Lines = array.new_line()
+var line[] tpsl2Lines = array.new_line()
+var label lrLabel = na
+
+// Range colors
+color lrColor = lrType == "Resistance" ? colorBuy : lrType == "Support" ? colorSell : colorNeutral
+
+// Draw Current Locked Range
+if lrActive and showLR
+    if na(lrBox)
+        lrBox := box.new(lrStartBar, lrHigh, bar_index, lrLow, 
+                        bgcolor=color.new(lrColor, 90), 
+                        border_color=lrColor, 
+                        border_width=2)
+    else
+        box.set_left(lrBox, lrStartBar)
+        box.set_top(lrBox, lrHigh)
+        box.set_right(lrBox, bar_index)
+        box.set_bottom(lrBox, lrLow)
+        box.set_bgcolor(lrBox, color.new(lrColor, 90))
+        box.set_border_color(lrBox, lrColor)
+    
+    // Range label
+    if na(lrLabel)
+        lrLabelText = lrType + "\n" + str.tostring(lrImbalance * 100, "#.#") + "%"
+        lrLabel := label.new(lrStartBar, lrHigh, lrLabelText, 
+                            color=color.new(lrColor, 0), 
+                            textcolor=color.white, 
+                            style=label.style_label_down, 
+                            size=size.small)
+else
+    if not na(lrBox)
+        box.delete(lrBox)
+        lrBox := na
+    if not na(lrLabel)
+        label.delete(lrLabel)
+        lrLabel := na
+
+// Draw TPSL 1 Lines
+if lrActive and showTPSL1 and not na(tpsl1High)
+    if array.size(tpsl1Lines) < 2
+        array.push(tpsl1Lines, line.new(lrEndBar, tpsl1High, bar_index, tpsl1High, 
+                                       color=color.new(colorBuy, 30), width=1, style=line.style_dashed))
+        array.push(tpsl1Lines, line.new(lrEndBar, tpsl1Low, bar_index, tpsl1Low, 
+                                       color=color.new(colorSell, 30), width=1, style=line.style_dashed))
+    else
+        line.set_x1(array.get(tpsl1Lines, 0), lrEndBar)
+        line.set_y1(array.get(tpsl1Lines, 0), tpsl1High)
+        line.set_x2(array.get(tpsl1Lines, 0), bar_index)
+        line.set_y2(array.get(tpsl1Lines, 0), tpsl1High)
+        
+        line.set_x1(array.get(tpsl1Lines, 1), lrEndBar)
+        line.set_y1(array.get(tpsl1Lines, 1), tpsl1Low)
+        line.set_x2(array.get(tpsl1Lines, 1), bar_index)
+        line.set_y2(array.get(tpsl1Lines, 1), tpsl1Low)
+else
+    if array.size(tpsl1Lines) > 0
+        for i = 0 to array.size(tpsl1Lines) - 1
+            line.delete(array.get(tpsl1Lines, i))
+        array.clear(tpsl1Lines)
+
+// Draw TPSL 2 Lines
+if lrActive and showTPSL2 and not na(tpsl2High)
+    if array.size(tpsl2Lines) < 2
+        array.push(tpsl2Lines, line.new(lrEndBar, tpsl2High, bar_index, tpsl2High, 
+                                       color=color.new(colorBuy, 50), width=1, style=line.style_dotted))
+        array.push(tpsl2Lines, line.new(lrEndBar, tpsl2Low, bar_index, tpsl2Low, 
+                                       color=color.new(colorSell, 50), width=1, style=line.style_dotted))
+    else
+        line.set_x1(array.get(tpsl2Lines, 0), lrEndBar)
+        line.set_y1(array.get(tpsl2Lines, 0), tpsl2High)
+        line.set_x2(array.get(tpsl2Lines, 0), bar_index)
+        line.set_y2(array.get(tpsl2Lines, 0), tpsl2High)
+        
+        line.set_x1(array.get(tpsl2Lines, 1), lrEndBar)
+        line.set_y1(array.get(tpsl2Lines, 1), tpsl2Low)
+        line.set_x2(array.get(tpsl2Lines, 1), bar_index)
+        line.set_y2(array.get(tpsl2Lines, 1), tpsl2Low)
+else
+    if array.size(tpsl2Lines) > 0
+        for i = 0 to array.size(tpsl2Lines) - 1
+            line.delete(array.get(tpsl2Lines, i))
+        array.clear(tpsl2Lines)
+
+// Draw imbalance arrows
+if lrActive and showImbalance and barstate.islast
+    if lrType == "Resistance" and lrImbalance > 0.15
+        label.new(bar_index, lrHigh + (lrHigh - lrLow) * 0.3, "▼", 
+                 color=color.new(colorSell, 0), textcolor=color.white, 
+                 style=label.style_label_down, size=size.large)
+    else if lrType == "Support" and lrImbalance < -0.15
+        label.new(bar_index, lrLow - (lrHigh - lrLow) * 0.3, "▲", 
+                 color=color.new(colorBuy, 0), textcolor=color.white, 
+                 style=label.style_label_up, size=size.large)
+
+// Draw breakout labels
+if showBreakoutLabels
+    if breakUp
+        label.new(bar_index, high, "▲ UP", 
+                 color=color.new(colorBuy, 0), textcolor=color.white, 
+                 style=label.style_label_up, size=size.normal)
+    
+    if breakDown
+        label.new(bar_index, low, "▼ DOWN", 
+                 color=color.new(colorSell, 0), textcolor=color.white, 
+                 style=label.style_label_down, size=size.normal)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INFORMATION TABLE
+// ═════════════════════════════════════════════════════════════════════════════
+
+var table infoTable = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "LRA Analysis", text_color=color.white, text_size=size.small)
+    table.merge_cells(infoTable, 0, 0, 1, 0)
+    
+    table.cell(infoTable, 0, 1, "Current Range", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 1, lrActive ? lrType : "None", text_color=lrActive ? lrColor : color.white, text_size=size.tiny)
+    
+    table.cell(infoTable, 0, 2, "Range High", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 2, lrActive ? str.tostring(lrHigh, "#.####") : "N/A", text_color=color.white, text_size=size.tiny)
+    
+    table.cell(infoTable, 0, 3, "Range Low", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 3, lrActive ? str.tostring(lrLow, "#.####") : "N/A", text_color=color.white, text_size=size.tiny)
+    
+    table.cell(infoTable, 0, 4, "Imbalance", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 4, lrActive ? str.tostring(lrImbalance * 100, "#.#") + "%" : "N/A", text_color=lrActive ? lrColor : color.white, text_size=size.tiny)
+    
+    table.cell(infoTable, 0, 5, "TPSL 1 High", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 5, lrActive and not na(tpsl1High) ? str.tostring(tpsl1High, "#.####") : "N/A", text_color=color.white, text_size=size.tiny)
+    
+    table.cell(infoTable, 0, 6, "TPSL 1 Low", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 6, lrActive and not na(tpsl1Low) ? str.tostring(tpsl1Low, "#.####") : "N/A", text_color=color.white, text_size=size.tiny)
+    
+    table.cell(infoTable, 0, 7, "Historical LRs", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 7, str.tostring(array.size(hist_lrHigh)), text_color=color.white, text_size=size.tiny)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+alertcondition(lrActive and lrType == "Resistance", title="Resistance LR Detected", message="Resistance Locked Range detected")
+alertcondition(lrActive and lrType == "Support", title="Support LR Detected", message="Support Locked Range detected")
+alertcondition(lrActive and lrType == "Gravitation", title="Gravitation LR Detected", message="Gravitation Locked Range detected")
+alertcondition(breakUp, title="Breakout Up", message="Price broke out above LR")
+alertcondition(breakDown, title="Breakout Down", message="Price broke out below LR")

@@ -1,0 +1,180 @@
+//@version=6
+strategy("LRA Simple Test Strategy", overlay=true, initial_capital=50000, default_qty_type=strategy.percent_of_equity, 
+         default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.05)
+
+// Simplified version for testing - shows when ranges are detected and trades should execute
+
+// INPUTS
+swingLen = input.int(5, "Swing Length")
+minBars = input.int(8, "Min Bars in Range")
+minImbalance = input.float(10.0, "Min Imbalance %")
+tradeResistance = input.bool(true, "Trade Resistance LR (Short)")
+tradeSupport = input.bool(true, "Trade Support LR (Long)")
+riskPct = input.float(2.0, "Risk %")
+
+// DETECT SWINGS
+swingHigh = ta.pivothigh(high, swingLen, swingLen)
+swingLow = ta.pivotlow(low, swingLen, swingLen)
+
+// Store swing points
+var float lastSwingHigh = na
+var float lastSwingLow = na
+
+if not na(swingHigh)
+    lastSwingHigh := swingHigh
+if not na(swingLow)
+    lastSwingLow := swingLow
+
+// RANGE DETECTION - Simple consolidation
+atr = ta.atr(14)
+avgBodySize = ta.sma(math.abs(close - open), 20)
+isConsolidating = avgBodySize < atr * 0.5
+
+// Track consolidation
+var float consHigh = na
+var float consLow = na
+var int consBars = 0
+var bool inRange = false
+
+if isConsolidating
+    if na(consHigh)
+        consHigh := high
+        consLow := low
+        consBars := 1
+    else
+        consHigh := math.max(consHigh, high)
+        consLow := math.min(consLow, low)
+        consBars := consBars + 1
+else
+    consHigh := na
+    consLow := na
+    consBars := 0
+    inRange := false
+
+// Confirm range after minimum bars
+if not inRange and consBars >= minBars
+    inRange := true
+
+// RANGE TYPE - Simplified volume analysis
+var string rangeType = "Neutral"
+var float rangeHigh = na
+var float rangeLow = na
+var bool setupActive = false
+
+if inRange and not setupActive
+    rangeHigh := consHigh
+    rangeLow := consLow
+    
+    // Simple imbalance: compare volume at highs vs lows
+    volAtHigh = 0.0
+    volAtLow = 0.0
+    
+    for i = 0 to math.min(consBars - 1, 20)
+        if high[i] >= rangeHigh * 0.99
+            volAtHigh := volAtHigh + volume[i]
+        if low[i] <= rangeLow * 1.01
+            volAtLow := volAtLow + volume[i]
+    
+    imbalance = volAtHigh > 0 and volAtLow > 0 ? (volAtHigh - volAtLow) / math.max(volAtHigh, volAtLow) * 100 : 0.0
+    
+    if math.abs(imbalance) >= minImbalance
+        if imbalance > 0
+            rangeType := "Resistance"
+        else
+            rangeType := "Support"
+        
+        setupActive := true
+
+// BREAKOUT DETECTION
+rangeSize = setupActive ? rangeHigh - rangeLow : 0.0
+breakUp = setupActive and close > rangeHigh and rangeSize > 0
+breakDown = setupActive and close < rangeLow and rangeSize > 0
+
+// ENTRY LOGIC - Only enter once per setup
+var bool tradeEntered = false
+
+if setupActive and not tradeEntered and strategy.position_size == 0
+    if breakDown and rangeType == "Resistance" and tradeResistance
+        stopLoss = rangeHigh + (rangeSize * 0.2)
+        takeProfit = rangeLow - rangeSize
+        
+        strategy.entry("Short", strategy.short, comment="LRA Short")
+        strategy.exit("Exit", "Short", stop=stopLoss, limit=takeProfit)
+        
+        tradeEntered := true
+    
+    if breakUp and rangeType == "Support" and tradeSupport
+        stopLoss = rangeLow - (rangeSize * 0.2)
+        takeProfit = rangeHigh + rangeSize
+        
+        strategy.entry("Long", strategy.long, comment="LRA Long")
+        strategy.exit("Exit", "Long", stop=stopLoss, limit=takeProfit)
+        
+        tradeEntered := true
+
+// Reset after trade closes
+if tradeEntered and strategy.position_size == 0 and strategy.position_size[1] != 0
+    setupActive := false
+    rangeType := "Neutral"
+    tradeEntered := false
+    consHigh := na
+    consLow := na
+    consBars := 0
+
+// Reset if price returns into range too much
+if setupActive and strategy.position_size == 0
+    if (high > rangeLow and low < rangeHigh)
+        returnPct = 0.0
+        if rangeType == "Resistance" and low < rangeLow
+            returnPct := (rangeLow - low) / rangeSize * 100
+        else if rangeType == "Support" and high > rangeHigh
+            returnPct := (high - rangeHigh) / rangeSize * 100
+        
+        if returnPct > 70
+            setupActive := false
+            rangeType := "Neutral"
+
+// VISUALIZATION
+bgcolor(setupActive ? color.new(rangeType == "Resistance" ? color.red : rangeType == "Support" ? color.green : color.gray, 95) : na)
+
+plotshape(setupActive and rangeType == "Resistance", "Resistance Setup", shape.triangledown, location.abovebar, color.red, size=size.tiny)
+plotshape(setupActive and rangeType == "Support", "Support Setup", shape.triangleup, location.belowbar, color.green, size=size.tiny)
+
+plotshape(breakDown and rangeType == "Resistance" and not tradeEntered, "Short Entry", shape.arrowdown, location.abovebar, color.new(color.red, 0), size=size.small)
+plotshape(breakUp and rangeType == "Support" and not tradeEntered, "Long Entry", shape.arrowup, location.belowbar, color.new(color.green, 0), size=size.small)
+
+// Draw range boxes
+var box rangeBox = na
+if setupActive
+    if na(rangeBox)
+        rangeBox := box.new(bar_index - consBars, rangeHigh, bar_index, rangeLow, 
+                           border_color=rangeType == "Resistance" ? color.red : color.green, 
+                           border_width=2, 
+                           bgcolor=color.new(rangeType == "Resistance" ? color.red : color.green, 90))
+    else
+        box.set_right(rangeBox, bar_index)
+else
+    if not na(rangeBox)
+        box.delete(rangeBox)
+        rangeBox := na
+
+// Debug info
+var table debugTable = table.new(position.top_right, 2, 6)
+if barstate.islast
+    table.cell(debugTable, 0, 0, "Status", bgcolor=color.gray, text_color=color.white)
+    table.cell(debugTable, 1, 0, setupActive ? "Setup Active" : "Searching", text_color=color.white)
+    
+    table.cell(debugTable, 0, 1, "Range Type", bgcolor=color.gray, text_color=color.white)
+    table.cell(debugTable, 1, 1, rangeType, text_color=color.white)
+    
+    table.cell(debugTable, 0, 2, "In Consolidation", bgcolor=color.gray, text_color=color.white)
+    table.cell(debugTable, 1, 2, isConsolidating ? "Yes (" + str.tostring(consBars) + " bars)" : "No", text_color=color.white)
+    
+    table.cell(debugTable, 0, 3, "Range", bgcolor=color.gray, text_color=color.white)
+    table.cell(debugTable, 1, 3, setupActive ? str.tostring(rangeHigh, "#.####") + " - " + str.tostring(rangeLow, "#.####") : "N/A", text_color=color.white)
+    
+    table.cell(debugTable, 0, 4, "Position", bgcolor=color.gray, text_color=color.white)
+    table.cell(debugTable, 1, 4, strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "Flat", text_color=color.white)
+    
+    table.cell(debugTable, 0, 5, "Total Trades", bgcolor=color.gray, text_color=color.white)
+    table.cell(debugTable, 1, 5, str.tostring(strategy.closedtrades), text_color=color.white)

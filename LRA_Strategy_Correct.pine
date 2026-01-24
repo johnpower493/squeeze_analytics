@@ -1,0 +1,322 @@
+//@version=6
+strategy("LRA Strategy (Book Accurate)", overlay=true, initial_capital=50000, 
+         default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+         commission_type=strategy.commission.percent, commission_value=0.05, 
+         pyramiding=0, calc_on_every_tick=false)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CORE LRA PRINCIPLE FROM BOOK:
+// "The market maker moves price AGAINST the majority of open positions"
+// - Resistance LR (buy positions prevail) → Price breaks DOWN
+// - Support LR (sell positions prevail) → Price breaks UP
+// ═════════════════════════════════════════════════════════════════════════════
+
+// INPUTS
+swingLen = input.int(5, "Swing Length", group="Range Detection")
+minRangeBars = input.int(8, "Minimum Bars in Range", minval=5, group="Range Detection")
+maxRangeBars = input.int(50, "Maximum Bars in Range", minval=20, group="Range Detection")
+
+minImbalance = input.float(15.0, "Minimum Imbalance %", minval=10, maxval=30, group="Trade Filters", 
+                           tooltip="Only trade when imbalance >= this. Book recommends >15%")
+tradeResistance = input.bool(true, "Trade Resistance LR (Short when buyers trapped)", group="Trade Filters")
+tradeSupport = input.bool(true, "Trade Support LR (Long when sellers trapped)", group="Trade Filters")
+
+stopBufferPct = input.float(20.0, "Stop Loss Buffer % of Range", minval=10, maxval=50, group="Risk Management")
+riskPct = input.float(1.0, "Risk Per Trade %", minval=0.5, maxval=3, group="Risk Management")
+useTwoTargets = input.bool(true, "Use Two Targets (50% + 50%)", group="Risk Management")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SWING DETECTION - Find Previous Swing Highs/Lows
+// ═════════════════════════════════════════════════════════════════════════════
+
+pivotHigh = ta.pivothigh(high, swingLen, swingLen)
+pivotLow = ta.pivotlow(low, swingLen, swingLen)
+
+var float[] swingHighs = array.new_float(20)
+var int[] swingHighBars = array.new_int(20)
+var float[] swingLows = array.new_float(20)
+var int[] swingLowBars = array.new_int(20)
+
+if not na(pivotHigh)
+    array.unshift(swingHighs, pivotHigh)
+    array.unshift(swingHighBars, bar_index - swingLen)
+    if array.size(swingHighs) > 20
+        array.pop(swingHighs)
+        array.pop(swingHighBars)
+
+if not na(pivotLow)
+    array.unshift(swingLows, pivotLow)
+    array.unshift(swingLowBars, bar_index - swingLen)
+    if array.size(swingLows) > 20
+        array.pop(swingLows)
+        array.pop(swingLowBars)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// LOCKED RANGE DETECTION
+// Per Book: Range where positions accumulate with volume imbalance at boundaries
+// ═════════════════════════════════════════════════════════════════════════════
+
+atr = ta.atr(14)
+narrowRange = (high - low) < ta.sma(high - low, 20) * 1.5
+
+// Track consolidation period
+var float rangeTop = na
+var float rangeBottom = na
+var int rangeStart = na
+var int rangeBars = 0
+var float volumeAtTop = 0.0
+var float volumeAtBottom = 0.0
+var int touchesTop = 0
+var int touchesBottom = 0
+
+// Build range during consolidation
+if narrowRange
+    if na(rangeTop)
+        rangeTop := high
+        rangeBottom := low
+        rangeStart := bar_index
+        rangeBars := 1
+        volumeAtTop := 0.0
+        volumeAtBottom := 0.0
+        touchesTop := 0
+        touchesBottom := 0
+    else
+        rangeTop := math.max(rangeTop, high)
+        rangeBottom := math.min(rangeBottom, low)
+        rangeBars := rangeBars + 1
+        
+        // Track volume at boundaries (KEY LRA CONCEPT)
+        touchThreshold = (rangeTop - rangeBottom) * 0.1
+        if high >= rangeTop - touchThreshold
+            volumeAtTop := volumeAtTop + volume
+            touchesTop := touchesTop + 1
+        if low <= rangeBottom + touchThreshold
+            volumeAtBottom := volumeAtBottom + volume
+            touchesBottom := touchesBottom + 1
+else
+    rangeTop := na
+    rangeBottom := na
+    rangeStart := na
+    rangeBars := 0
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DETERMINE RANGE TYPE AND IMBALANCE
+// ═════════════════════════════════════════════════════════════════════════════
+
+var bool rangeConfirmed = false
+var float confirmedTop = na
+var float confirmedBottom = na
+var int confirmedStart = na
+var string rangeType = "Neutral"
+var float imbalancePct = 0.0
+var bool tradeActive = false
+
+// Confirm range and calculate imbalance
+if not rangeConfirmed and rangeBars >= minRangeBars and rangeBars <= maxRangeBars
+    if touchesTop > 0 or touchesBottom > 0
+        // Calculate imbalance per book methodology
+        avgVolTop = touchesTop > 0 ? volumeAtTop / touchesTop : 0
+        avgVolBottom = touchesBottom > 0 ? volumeAtBottom / touchesBottom : 0
+        
+        maxVol = math.max(avgVolTop, avgVolBottom)
+        if maxVol > 0
+            imbalance = (avgVolTop - avgVolBottom) / maxVol
+            imbalancePct := imbalance * 100
+            
+            // Determine range type (KEY: This shows where positions are TRAPPED)
+            if imbalancePct > 10
+                rangeType := "Resistance"  // BUY positions accumulating = BEARISH
+            else if imbalancePct < -10
+                rangeType := "Support"     // SELL positions accumulating = BULLISH
+            else
+                rangeType := "Gravitation" // Balanced
+            
+            // Confirm range
+            rangeConfirmed := true
+            confirmedTop := rangeTop
+            confirmedBottom := rangeBottom
+            confirmedStart := rangeStart
+            tradeActive := false
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CALCULATE TPSL LEVELS (Per Book Chapter 2.2)
+// ═════════════════════════════════════════════════════════════════════════════
+
+float tpsl1High = na
+float tpsl1Low = na
+
+// Variables for TPSL calculation
+var float calcTpsl1High = na
+var float calcTpsl1Low = na
+
+if rangeConfirmed
+    rangeHeight = confirmedTop - confirmedBottom
+    
+    // Find previous swing before range
+    float prevSwingHigh = na
+    float prevSwingLow = na
+    
+    if array.size(swingHighs) > 0
+        for i = 0 to math.min(array.size(swingHighs) - 1, 10)
+            if array.get(swingHighBars, i) < confirmedStart
+                prevSwingHigh := array.get(swingHighs, i)
+                break
+    
+    if array.size(swingLows) > 0
+        for i = 0 to math.min(array.size(swingLows) - 1, 10)
+            if array.get(swingLowBars, i) < confirmedStart
+                prevSwingLow := array.get(swingLows, i)
+                break
+    
+    // TPSL 1: Previous swing or range height projection
+    calcTpsl1High := not na(prevSwingHigh) and prevSwingHigh > confirmedTop ? prevSwingHigh : confirmedTop + rangeHeight
+    calcTpsl1Low := not na(prevSwingLow) and prevSwingLow < confirmedBottom ? prevSwingLow : confirmedBottom - rangeHeight
+    
+    tpsl1High := calcTpsl1High
+    tpsl1Low := calcTpsl1Low
+
+// ═════════════════════════════════════════════════════════════════════════════
+// BREAKOUT DETECTION
+// ═════════════════════════════════════════════════════════════════════════════
+
+rangeSize = rangeConfirmed ? confirmedTop - confirmedBottom : 0
+breakoutUp = rangeConfirmed and close > confirmedTop and rangeSize > 0
+breakoutDown = rangeConfirmed and close < confirmedBottom and rangeSize > 0
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TRADE LOGIC - CRITICAL: Trade AGAINST trapped positions!
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Resistance LR: Buyers trapped → SHORT when breaks DOWN
+if rangeConfirmed and not tradeActive and strategy.position_size == 0
+    if breakoutDown and rangeType == "Resistance" and tradeResistance and math.abs(imbalancePct) >= minImbalance
+        // Buyers are trapped above, price breaks down
+        stopLoss = confirmedTop + (rangeSize * stopBufferPct / 100)
+        target1 = tpsl1Low
+        target2 = confirmedBottom - (rangeSize * 1.5)
+        
+        strategy.entry("Short", strategy.short, comment="Resistance LR Short")
+        
+        if useTwoTargets
+            strategy.exit("TP1", "Short", limit=target1, stop=stopLoss, qty_percent=50)
+            strategy.exit("TP2", "Short", limit=target2, stop=stopLoss, qty_percent=50)
+        else
+            strategy.exit("Exit", "Short", limit=target1, stop=stopLoss)
+        
+        tradeActive := true
+
+// Support LR: Sellers trapped → LONG when breaks UP
+if rangeConfirmed and not tradeActive and strategy.position_size == 0
+    if breakoutUp and rangeType == "Support" and tradeSupport and math.abs(imbalancePct) >= minImbalance
+        // Sellers are trapped below, price breaks up
+        stopLoss = confirmedBottom - (rangeSize * stopBufferPct / 100)
+        target1 = tpsl1High
+        target2 = confirmedTop + (rangeSize * 1.5)
+        
+        strategy.entry("Long", strategy.long, comment="Support LR Long")
+        
+        if useTwoTargets
+            strategy.exit("TP1", "Long", limit=target1, stop=stopLoss, qty_percent=50)
+            strategy.exit("TP2", "Long", limit=target2, stop=stopLoss, qty_percent=50)
+        else
+            strategy.exit("Exit", "Long", limit=target1, stop=stopLoss)
+        
+        tradeActive := true
+
+// Range cancellation (per book: if returns >70% into range)
+if rangeConfirmed and not tradeActive
+    if rangeType == "Resistance" or rangeType == "Support"
+        returnPct = 0.0
+        if high > confirmedBottom and low < confirmedTop
+            if rangeType == "Resistance" and low < confirmedTop
+                returnPct := (confirmedTop - low) / rangeSize * 100
+            else if rangeType == "Support" and high > confirmedBottom
+                returnPct := (high - confirmedBottom) / rangeSize * 100
+        
+        if returnPct > 70
+            rangeConfirmed := false
+            rangeType := "Neutral"
+
+// Reset after trade closes
+if tradeActive and strategy.position_size == 0 and strategy.position_size[1] != 0
+    rangeConfirmed := false
+    tradeActive := false
+    rangeType := "Neutral"
+    imbalancePct := 0.0
+
+// ═════════════════════════════════════════════════════════════════════════════
+// VISUALIZATION
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Draw confirmed range
+var box rangeBox = na
+if rangeConfirmed
+    boxColor = rangeType == "Resistance" ? color.red : rangeType == "Support" ? color.green : color.gray
+    if na(rangeBox)
+        rangeBox := box.new(confirmedStart, confirmedTop, bar_index, confirmedBottom,
+                           border_color=boxColor, border_width=2,
+                           bgcolor=color.new(boxColor, 90))
+    else
+        box.set_right(rangeBox, bar_index)
+else
+    if not na(rangeBox)
+        box.delete(rangeBox)
+        rangeBox := na
+
+// Draw TPSL lines
+var line tpsl1HighLine = na
+var line tpsl1LowLine = na
+
+if rangeConfirmed and not na(tpsl1High)
+    if na(tpsl1HighLine)
+        tpsl1HighLine := line.new(bar_index, tpsl1High, bar_index, tpsl1High,
+                                  color=color.green, width=1, style=line.style_dashed)
+    else
+        line.set_x2(tpsl1HighLine, bar_index)
+    
+    if na(tpsl1LowLine)
+        tpsl1LowLine := line.new(bar_index, tpsl1Low, bar_index, tpsl1Low,
+                                 color=color.red, width=1, style=line.style_dashed)
+    else
+        line.set_x2(tpsl1LowLine, bar_index)
+else
+    if not na(tpsl1HighLine)
+        line.delete(tpsl1HighLine)
+        tpsl1HighLine := na
+    if not na(tpsl1LowLine)
+        line.delete(tpsl1LowLine)
+        tpsl1LowLine := na
+
+// Trade markers
+plotshape(breakoutDown and rangeType == "Resistance" and not tradeActive and math.abs(imbalancePct) >= minImbalance,
+         "SHORT Setup", shape.triangledown, location.abovebar, color.red, size=size.small)
+plotshape(breakoutUp and rangeType == "Support" and not tradeActive and math.abs(imbalancePct) >= minImbalance,
+         "LONG Setup", shape.triangleup, location.belowbar, color.green, size=size.small)
+
+// Debug table
+var table infoTable = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 85))
+if barstate.islast
+    table.cell(infoTable, 0, 0, "LRA Status", bgcolor=color.gray, text_color=color.white)
+    table.cell(infoTable, 1, 0, rangeConfirmed ? "Range Active" : "Searching", text_color=color.white)
+    
+    table.cell(infoTable, 0, 1, "Range Type", bgcolor=color.gray, text_color=color.white)
+    table.cell(infoTable, 1, 1, rangeType, 
+              text_color=rangeType == "Resistance" ? color.red : rangeType == "Support" ? color.green : color.gray)
+    
+    table.cell(infoTable, 0, 2, "Imbalance %", bgcolor=color.gray, text_color=color.white)
+    table.cell(infoTable, 1, 2, str.tostring(imbalancePct, "#.#") + "%", text_color=color.white)
+    
+    table.cell(infoTable, 0, 3, "Min Required", bgcolor=color.gray, text_color=color.white)
+    table.cell(infoTable, 1, 3, str.tostring(minImbalance, "#.#") + "%", text_color=color.yellow)
+    
+    table.cell(infoTable, 0, 4, "Position", bgcolor=color.gray, text_color=color.white)
+    table.cell(infoTable, 1, 4, strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "Flat", 
+              text_color=color.white)
+    
+    table.cell(infoTable, 0, 5, "Total Trades", bgcolor=color.gray, text_color=color.white)
+    table.cell(infoTable, 1, 5, str.tostring(strategy.closedtrades), text_color=color.white)
+    
+    table.cell(infoTable, 0, 6, "Win Rate", bgcolor=color.gray, text_color=color.white)
+    winRate = strategy.closedtrades > 0 ? (strategy.wintrades / strategy.closedtrades * 100) : 0
+    table.cell(infoTable, 1, 6, str.tostring(winRate, "#.#") + "%", 
+              text_color=winRate >= 65 ? color.green : winRate >= 55 ? color.yellow : color.red)
