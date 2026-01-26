@@ -1,0 +1,666 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © 2026 Locked Range Analysis - Improved Version (Based on Tom Leksey's Book)
+
+//@version=6
+indicator("LRA - Multi-Timeframe Enhanced", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUT PARAMETERS (Per Book Chapter 2.3 - Recommended 1H-4H timeframes)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Range Detection Settings
+grpRange = "Range Detection"
+swingLength        = input.int(5, "Swing High/Low Length", minval=2, maxval=20, group=grpRange, tooltip="Used for TPSL level detection")
+rangeMinBars       = input.int(8, "Minimum Bars in Range", minval=3, maxval=50, group=grpRange, tooltip="Minimum consolidation period")
+rangeMaxBars       = input.int(100, "Maximum Bars in Range", minval=20, maxval=300, group=grpRange, tooltip="Maximum range duration before reset")
+narrowMult         = input.float(0.8, "Narrow Range ATR Multiplier", minval=0.3, maxval=2.0, step=0.1, group=grpRange, tooltip="Candle range < ATR * this value = consolidating")
+touchThresholdPct  = input.float(10.0, "Boundary Touch Threshold %", minval=5.0, maxval=25.0, step=1.0, group=grpRange, tooltip="% of range height to count as boundary touch")
+
+// Imbalance Settings (Per Chapter 2.4)
+grpImbalance = "Imbalance Detection"
+minImbalancePct    = input.float(15.0, "Minimum Imbalance % for LR", minval=5.0, maxval=30.0, step=1.0, group=grpImbalance, tooltip="Per book: >15% = significant imbalance")
+strongImbalancePct = input.float(25.0, "Strong Imbalance %", minval=15.0, maxval=50.0, step=1.0, group=grpImbalance, tooltip="Threshold for strong sentiment")
+
+// Breakout & Cancellation Settings (Per Chapter 2.4)
+grpBreakout = "Breakout & Cancellation"
+breakoutThreshold  = input.float(0.5, "Breakout Threshold % of Range", minval=0.1, maxval=5.0, step=0.1, group=grpBreakout, tooltip="Close beyond range + this % confirms breakout")
+cancelReturnPct    = input.float(70.0, "LR Cancellation Return %", minval=50.0, maxval=90.0, step=5.0, group=grpBreakout, tooltip="Per book: >70% return cancels Resistance/Support LR")
+gravCancelPct      = input.float(50.0, "Gravitation Cancel Return %", minval=30.0, maxval=70.0, step=5.0, group=grpBreakout, tooltip="Per book: 30-70% return cancels Gravitation LR")
+
+// Multi-Timeframe Settings
+grpMTF = "Multi-Timeframe Analysis"
+useMTF             = input.bool(true, "Enable Multi-Timeframe Confirmation", group=grpMTF)
+htfTimeframe       = input.timeframe("240", "Higher Timeframe", group=grpMTF, tooltip="For confirming range on higher TF")
+
+// TPSL Settings (Per Chapter 2.2)
+grpTPSL = "TPSL Levels"
+tpsl1Method        = input.string("Auto", "TPSL 1 Method", options=["Auto", "Swing", "Range Height"], group=grpTPSL, tooltip="Auto uses swing if available, else range height")
+useTPSL2           = input.bool(true, "Show TPSL 2 Levels", group=grpTPSL)
+rangeHeightMult    = input.float(1.0, "Range Height Multiplier for TPSL1", minval=0.5, maxval=2.0, step=0.1, group=grpTPSL)
+
+// Visual Settings
+grpVisual = "Visual Settings"
+showLR             = input.bool(true, "Show Locked Ranges", group=grpVisual)
+showTPSL1          = input.bool(true, "Show TPSL 1 Levels", group=grpVisual)
+showTPSL2          = input.bool(true, "Show TPSL 2 Levels", group=grpVisual)
+showImbalance      = input.bool(true, "Show Imbalance Indicator", group=grpVisual)
+showVolDegree      = input.bool(true, "Show Volume Degree (TOI)", group=grpVisual)
+maxHistoricalRanges = input.int(15, "Max Historical Ranges", minval=1, maxval=50, group=grpVisual)
+showBreakoutLabels = input.bool(true, "Show Breakout Labels", group=grpVisual)
+showCancellation   = input.bool(true, "Show Cancellation Events", group=grpVisual)
+
+// Color Settings
+grpColors = "Colors"
+colorResistance    = input.color(color.new(color.red, 0), "Resistance LR (Buyers Trapped)", group=grpColors)
+colorSupport       = input.color(color.new(color.green, 0), "Support LR (Sellers Trapped)", group=grpColors)
+colorGravitation   = input.color(color.new(color.gray, 0), "Gravitation LR (Balanced)", group=grpColors)
+historicalTransp   = input.int(85, "Historical Range Transparency", minval=50, maxval=95, group=grpColors)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CORE CALCULATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+atrVal = ta.atr(14)
+avgVolume = ta.sma(volume, 20)
+
+// Pivot High/Low detection for TPSL levels
+pivotHigh = ta.pivothigh(high, swingLength, swingLength)
+pivotLow  = ta.pivotlow(low, swingLength, swingLength)
+
+// Store swing highs and lows (most recent first)
+var float[] swingHighs    = array.new_float(100)
+var float[] swingLows     = array.new_float(100)
+var int[]   swingHighBars = array.new_int(100)
+var int[]   swingLowBars  = array.new_int(100)
+
+// Update swing arrays when new pivots detected
+if not na(pivotHigh)
+    array.unshift(swingHighs, pivotHigh)
+    array.unshift(swingHighBars, bar_index - swingLength)
+    if array.size(swingHighs) > 50
+        array.pop(swingHighs)
+        array.pop(swingHighBars)
+
+if not na(pivotLow)
+    array.unshift(swingLows, pivotLow)
+    array.unshift(swingLowBars, bar_index - swingLength)
+    if array.size(swingLows) > 50
+        array.pop(swingLows)
+        array.pop(swingLowBars)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MULTI-TIMEFRAME CONFIRMATION (Per Chapter 2.3)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Get higher timeframe data for confirmation
+[htfHigh, htfLow, htfClose, htfVolume] = request.security(syminfo.tickerid, htfTimeframe, [high, low, close, volume])
+htfATR = request.security(syminfo.tickerid, htfTimeframe, ta.atr(14))
+htfAvgRange = request.security(syminfo.tickerid, htfTimeframe, ta.sma(high - low, 20))
+
+// HTF consolidation check
+htfIsConsolidating = useMTF ? (htfHigh - htfLow) < htfAvgRange * 1.2 : true
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HISTORICAL LOCKED RANGE STORAGE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var array<float>  hist_lrHigh       = array.new<float>()
+var array<float>  hist_lrLow        = array.new<float>()
+var array<int>    hist_lrStartBar   = array.new<int>()
+var array<int>    hist_lrEndBar     = array.new<int>()
+var array<string> hist_lrType       = array.new<string>()
+var array<float>  hist_lrImbalance  = array.new<float>()
+var array<string> hist_lrVolDegree  = array.new<string>()  // NEW: Volume degree (Low/Medium/High)
+var array<bool>   hist_lrCancelled  = array.new<bool>()    // NEW: Track if cancelled
+
+var array<box>    hist_lrBoxes      = array.new<box>()
+var array<label>  hist_lrLabels     = array.new<label>()
+
+// Function to add completed LR to history
+addToHistory(float lrH, float lrL, int startBar, int endBar, string lrT, float lrImb, string volDeg, bool cancelled) =>
+    array.push(hist_lrHigh, lrH)
+    array.push(hist_lrLow, lrL)
+    array.push(hist_lrStartBar, startBar)
+    array.push(hist_lrEndBar, endBar)
+    array.push(hist_lrType, lrT)
+    array.push(hist_lrImbalance, lrImb)
+    array.push(hist_lrVolDegree, volDeg)
+    array.push(hist_lrCancelled, cancelled)
+
+    // Determine color based on type (per book: Resistance=buyers trapped, Support=sellers trapped)
+    histColor = lrT == "Resistance" ? colorResistance : lrT == "Support" ? colorSupport : colorGravitation
+    borderStyle = cancelled ? line.style_dotted : line.style_dashed
+
+    // Draw box
+    b = box.new(startBar, lrH, endBar, lrL,
+        bgcolor=color.new(histColor, historicalTransp),
+        border_color=color.new(histColor, cancelled ? 70 : 50),
+        border_width=cancelled ? 1 : 2,
+        border_style=borderStyle)
+    array.push(hist_lrBoxes, b)
+
+    // Draw label with type, imbalance, and volume degree
+    lblText = lrT + "\n" + str.tostring(lrImb * 100, "#.#") + "%" + (showVolDegree ? "\nTOI: " + volDeg : "") + (cancelled ? "\n[CANCELLED]" : "")
+    l = label.new(startBar, lrH, lblText,
+        color=color.new(histColor, historicalTransp),
+        textcolor=color.new(histColor, cancelled ? 50 : 20),
+        style=label.style_label_down,
+        size=size.tiny)
+    array.push(hist_lrLabels, l)
+
+    // Enforce max history
+    while array.size(hist_lrHigh) > maxHistoricalRanges
+        if array.size(hist_lrBoxes) > 0
+            box.delete(array.shift(hist_lrBoxes))
+        if array.size(hist_lrLabels) > 0
+            label.delete(array.shift(hist_lrLabels))
+        array.shift(hist_lrHigh)
+        array.shift(hist_lrLow)
+        array.shift(hist_lrStartBar)
+        array.shift(hist_lrEndBar)
+        array.shift(hist_lrType)
+        array.shift(hist_lrImbalance)
+        array.shift(hist_lrVolDegree)
+        array.shift(hist_lrCancelled)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOCKED RANGE DETECTION (Per Chapter 2.1 & 2.4)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Current LR state variables
+var float  lrHigh         = na
+var float  lrLow          = na
+var int    lrStartBar     = na
+var int    lrEndBar       = na
+var bool   lrActive       = false
+var string lrType         = "Neutral"
+var float  lrImbalance    = 0.0
+var string lrVolDegree    = "Low"  // Per Chapter 2.4: Low/Medium/High
+var bool   lrBrokenOut    = false  // Track if breakout occurred
+var int    lrBreakoutBar  = na     // Bar where breakout happened
+
+// Range detection accumulators
+var int    rangeBarCount     = 0
+var float  sumVolAtHigh      = 0.0   // Volume accumulated at range high (buy pressure)
+var float  sumVolAtLow       = 0.0   // Volume accumulated at range low (sell pressure)
+var int    touchesAtHigh     = 0     // Count of touches at high
+var int    touchesAtLow      = 0     // Count of touches at low
+var float  currentRangeTop   = na
+var float  currentRangeBottom = na
+var int    currentRangeStart = na
+var float  totalRangeVolume  = 0.0   // Total volume in range
+
+// Consolidation detection
+priceRange = high - low
+avgRange   = ta.sma(priceRange, 20)
+isNarrowRange = priceRange < atrVal * narrowMult
+
+// Track activation for one-time events
+bool lrJustActivated = false
+bool lrJustCancelled = false
+
+// Main range detection logic
+if not lrActive
+    lrJustActivated := false
+    
+    if isNarrowRange and htfIsConsolidating
+        if na(currentRangeTop)
+            // Initialize new potential range
+            currentRangeTop    := high
+            currentRangeBottom := low
+            currentRangeStart  := bar_index
+            rangeBarCount      := 1
+            touchesAtHigh      := 0
+            touchesAtLow       := 0
+            sumVolAtHigh       := 0.0
+            sumVolAtLow        := 0.0
+            totalRangeVolume   := volume
+        else
+            // Expand range boundaries
+            currentRangeTop    := math.max(currentRangeTop, high)
+            currentRangeBottom := math.min(currentRangeBottom, low)
+            rangeBarCount      := rangeBarCount + 1
+            totalRangeVolume   := totalRangeVolume + volume
+
+            // Calculate touch threshold based on range height
+            rangeHt = currentRangeTop - currentRangeBottom
+            touchThreshold = rangeHt * (touchThresholdPct / 100.0)
+
+            // Per Chapter 2.4: Track volume at boundaries for imbalance
+            // Volume at HIGH = Buy pressure (buyers entering at top)
+            if high >= currentRangeTop - touchThreshold
+                touchesAtHigh := touchesAtHigh + 1
+                sumVolAtHigh  := sumVolAtHigh + volume
+            
+            // Volume at LOW = Sell pressure (sellers entering at bottom)
+            if low <= currentRangeBottom + touchThreshold
+                touchesAtLow := touchesAtLow + 1
+                sumVolAtLow  := sumVolAtLow + volume
+
+        // Check if range qualifies as LR
+        if rangeBarCount >= rangeMinBars and (touchesAtHigh > 0 or touchesAtLow > 0)
+            // Calculate imbalance per Chapter 2.4
+            avgVolHigh = touchesAtHigh > 0 ? sumVolAtHigh / touchesAtHigh : 0.0
+            avgVolLow  = touchesAtLow > 0 ? sumVolAtLow / touchesAtLow : 0.0
+            maxAvgVol  = math.max(avgVolHigh, avgVolLow)
+            
+            // Imbalance: positive = more buy pressure (Resistance), negative = more sell pressure (Support)
+            rawImbalance = maxAvgVol > 0 ? (avgVolHigh - avgVolLow) / maxAvgVol : 0.0
+            
+            // Per Chapter 2.4: Determine volume degree (TOI - Thinkable Open Interest)
+            // Based on total volume relative to average
+            volRatio = totalRangeVolume / (avgVolume * rangeBarCount)
+            volDegree = volRatio > 1.5 ? "High" : volRatio > 0.8 ? "Medium" : "Low"
+
+            // Per Chapter 2.1: Classify range type
+            // Resistance LR = Buy positions prevail (buyers trapped) - price will go DOWN
+            // Support LR = Sell positions prevail (sellers trapped) - price will go UP
+            absImbalance = math.abs(rawImbalance) * 100
+            
+            if absImbalance >= minImbalancePct
+                if rawImbalance > 0
+                    lrType := "Resistance"  // Buyers trapped at top
+                else
+                    lrType := "Support"     // Sellers trapped at bottom
+            else
+                lrType := "Gravitation"     // No significant imbalance
+            
+            // Activate LR
+            lrActive       := true
+            lrHigh         := currentRangeTop
+            lrLow          := currentRangeBottom
+            lrStartBar     := currentRangeStart
+            lrEndBar       := bar_index
+            lrImbalance    := rawImbalance
+            lrVolDegree    := volDegree
+            lrBrokenOut    := false
+            lrBreakoutBar  := na
+            lrJustActivated := true
+
+            // Reset accumulators
+            currentRangeTop    := na
+            currentRangeBottom := na
+            currentRangeStart  := na
+            rangeBarCount      := 0
+            sumVolAtHigh       := 0.0
+            sumVolAtLow        := 0.0
+            touchesAtHigh      := 0
+            touchesAtLow       := 0
+            totalRangeVolume   := 0.0
+    else
+        // Not consolidating - reset detection
+        currentRangeTop    := na
+        currentRangeBottom := na
+        currentRangeStart  := na
+        rangeBarCount      := 0
+        sumVolAtHigh       := 0.0
+        sumVolAtLow        := 0.0
+        touchesAtHigh      := 0
+        touchesAtLow       := 0
+        totalRangeVolume   := 0.0
+
+    // Reset if detection too long
+    if not na(currentRangeStart) and (bar_index - currentRangeStart) > rangeMaxBars
+        currentRangeTop    := na
+        currentRangeBottom := na
+        currentRangeStart  := na
+        rangeBarCount      := 0
+        sumVolAtHigh       := 0.0
+        sumVolAtLow        := 0.0
+        touchesAtHigh      := 0
+        touchesAtLow       := 0
+        totalRangeVolume   := 0.0
+else
+    // LR is active - update end bar
+    lrEndBar := bar_index
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BREAKOUT & CANCELLATION DETECTION (Per Chapter 2.4)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+rangeHeight = lrActive ? (lrHigh - lrLow) : na
+breakAmt    = lrActive and not na(rangeHeight) ? rangeHeight * (breakoutThreshold / 100.0) : na
+
+// Breakout conditions
+breakUpConfirm   = lrActive and not na(breakAmt) and close > (lrHigh + breakAmt) and high > lrHigh
+breakDownConfirm = lrActive and not na(breakAmt) and close < (lrLow - breakAmt) and low < lrLow
+
+// One-time breakout events
+bool breakUp   = breakUpConfirm and not breakUpConfirm[1]
+bool breakDown = breakDownConfirm and not breakDownConfirm[1]
+
+// Per Chapter 2.4: LR Cancellation - price return into range
+// >70% return cancels Resistance/Support LR
+// 30-70% return cancels Gravitation LR
+bool cancelCondition = false
+float returnPct = na
+
+if lrActive and lrBrokenOut and not na(lrBreakoutBar)
+    // Calculate how far price has returned into the range
+    if lrType == "Resistance" or lrType == "Support"
+        // For Resistance (broke down): check if price returned up into range
+        if close[1] < lrLow and close > lrLow
+            returnPct := (close - lrLow) / rangeHeight * 100
+            if returnPct > cancelReturnPct
+                cancelCondition := true
+        // For Support (broke up): check if price returned down into range  
+        if close[1] > lrHigh and close < lrHigh
+            returnPct := (lrHigh - close) / rangeHeight * 100
+            if returnPct > cancelReturnPct
+                cancelCondition := true
+    else if lrType == "Gravitation"
+        // Gravitation cancels at lower threshold
+        if (close[1] < lrLow and close > lrLow) or (close[1] > lrHigh and close < lrHigh)
+            midRange = (lrHigh + lrLow) / 2
+            returnPct := math.abs(close - midRange) / (rangeHeight / 2) * 100
+            returnPct := 100 - returnPct  // Convert to "how far into range"
+            if returnPct > gravCancelPct
+                cancelCondition := true
+
+// Track breakout state
+if (breakUp or breakDown) and lrActive
+    lrBrokenOut   := true
+    lrBreakoutBar := bar_index
+
+// Handle breakout - save to history
+if breakUp or breakDown
+    if lrActive and not cancelCondition
+        addToHistory(lrHigh, lrLow, lrStartBar, lrEndBar, lrType, lrImbalance, lrVolDegree, false)
+    
+    // Reset LR state
+    lrActive      := false
+    lrHigh        := na
+    lrLow         := na
+    lrStartBar    := na
+    lrEndBar      := na
+    lrType        := "Neutral"
+    lrImbalance   := 0.0
+    lrBrokenOut   := false
+    lrBreakoutBar := na
+
+// Handle cancellation
+if cancelCondition and lrActive
+    lrJustCancelled := true
+    addToHistory(lrHigh, lrLow, lrStartBar, lrEndBar, lrType, lrImbalance, lrVolDegree, true)
+    
+    // Reset LR state
+    lrActive      := false
+    lrHigh        := na
+    lrLow         := na
+    lrStartBar    := na
+    lrEndBar      := na
+    lrType        := "Neutral"
+    lrImbalance   := 0.0
+    lrBrokenOut   := false
+    lrBreakoutBar := na
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TPSL LEVELS CALCULATION (Per Chapter 2.2)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var float prevSwingHigh    = na
+var float prevSwingLow     = na
+var int   prevSwingHighBar = na
+var int   prevSwingLowBar  = na
+var float prevSwingHigh2   = na  // For TPSL2
+var float prevSwingLow2    = na
+
+// Find previous swings when LR activates
+if lrJustActivated
+    prevSwingHigh    := na
+    prevSwingLow     := na
+    prevSwingHighBar := na
+    prevSwingLowBar  := na
+    prevSwingHigh2   := na
+    prevSwingLow2    := na
+
+    // Find first swing high before range
+    for i = 0 to array.size(swingHighs) - 1
+        if array.get(swingHighBars, i) < lrStartBar
+            if na(prevSwingHigh)
+                prevSwingHigh    := array.get(swingHighs, i)
+                prevSwingHighBar := array.get(swingHighBars, i)
+            else if na(prevSwingHigh2)
+                prevSwingHigh2   := array.get(swingHighs, i)
+                break
+
+    // Find first swing low before range
+    for i = 0 to array.size(swingLows) - 1
+        if array.get(swingLowBars, i) < lrStartBar
+            if na(prevSwingLow)
+                prevSwingLow    := array.get(swingLows, i)
+                prevSwingLowBar := array.get(swingLowBars, i)
+            else if na(prevSwingLow2)
+                prevSwingLow2   := array.get(swingLows, i)
+                break
+
+// Calculate TPSL1 levels per Chapter 2.2
+float tpsl1High = na
+float tpsl1Low  = na
+
+if lrActive and not na(rangeHeight)
+    rh = rangeHeight * rangeHeightMult
+
+    if tpsl1Method == "Swing"
+        tpsl1High := not na(prevSwingHigh) ? prevSwingHigh : lrHigh + rh
+        tpsl1Low  := not na(prevSwingLow) ? prevSwingLow : lrLow - rh
+    else if tpsl1Method == "Range Height"
+        tpsl1High := lrHigh + rh
+        tpsl1Low  := lrLow - rh
+    else // Auto - per book recommendation
+        // Use swing if it's beyond the range, else use range height projection
+        tpsl1High := (not na(prevSwingHigh) and prevSwingHigh > lrHigh) ? prevSwingHigh : lrHigh + rh
+        tpsl1Low  := (not na(prevSwingLow) and prevSwingLow < lrLow) ? prevSwingLow : lrLow - rh
+
+// Calculate TPSL2 levels - swing behind TPSL1
+float tpsl2High = na
+float tpsl2Low  = na
+
+if lrActive and useTPSL2
+    // TPSL2 High: swing behind TPSL1 swing
+    if not na(prevSwingHigh2) and prevSwingHigh2 > tpsl1High
+        tpsl2High := prevSwingHigh2
+    else if not na(tpsl1High)
+        tpsl2High := tpsl1High + rangeHeight * 0.5  // Extend by half range
+    
+    // TPSL2 Low: swing behind TPSL1 swing
+    if not na(prevSwingLow2) and prevSwingLow2 < tpsl1Low
+        tpsl2Low := prevSwingLow2
+    else if not na(tpsl1Low)
+        tpsl2Low := tpsl1Low - rangeHeight * 0.5
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VISUALIZATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var box   lrBox   = na
+var line[] tpsl1Lines = array.new_line()
+var line[] tpsl2Lines = array.new_line()
+var label lrLabel = na
+var label imbalanceLabel = na
+
+// Get current LR color based on type
+color lrColor = lrType == "Resistance" ? colorResistance : lrType == "Support" ? colorSupport : colorGravitation
+
+// Draw Current Locked Range Box
+if lrActive and showLR
+    if na(lrBox)
+        lrBox := box.new(lrStartBar, lrHigh, bar_index, lrLow,
+            bgcolor=color.new(lrColor, 90),
+            border_color=lrColor,
+            border_width=2)
+    else
+        box.set_left(lrBox, lrStartBar)
+        box.set_top(lrBox, lrHigh)
+        box.set_right(lrBox, bar_index)
+        box.set_bottom(lrBox, lrLow)
+        box.set_bgcolor(lrBox, color.new(lrColor, 90))
+        box.set_border_color(lrBox, lrColor)
+
+    // Range label with type, imbalance, and TOI
+    imbalancePct = math.abs(lrImbalance) * 100
+    strengthStr = imbalancePct >= strongImbalancePct ? "Strong" : imbalancePct >= minImbalancePct ? "Moderate" : "Weak"
+    lrLabelText = lrType + " LR\n" + str.tostring(lrImbalance * 100, "#.#") + "% (" + strengthStr + ")" + (showVolDegree ? "\nTOI: " + lrVolDegree : "")
+    
+    if na(lrLabel)
+        lrLabel := label.new(lrStartBar, lrHigh, lrLabelText,
+            color=color.new(lrColor, 0),
+            textcolor=color.white,
+            style=label.style_label_down,
+            size=size.small)
+    else
+        label.set_x(lrLabel, lrStartBar)
+        label.set_y(lrLabel, lrHigh)
+        label.set_text(lrLabel, lrLabelText)
+        label.set_color(lrLabel, color.new(lrColor, 0))
+else
+    if not na(lrBox)
+        box.delete(lrBox)
+        lrBox := na
+    if not na(lrLabel)
+        label.delete(lrLabel)
+        lrLabel := na
+    if not na(imbalanceLabel)
+        label.delete(imbalanceLabel)
+        imbalanceLabel := na
+
+// Draw TPSL 1 Lines
+if lrActive and showTPSL1 and not na(tpsl1High) and not na(tpsl1Low)
+    if array.size(tpsl1Lines) < 2
+        array.push(tpsl1Lines, line.new(lrEndBar, tpsl1High, bar_index, tpsl1High, color=color.new(colorSupport, 30), width=2, style=line.style_dashed))
+        array.push(tpsl1Lines, line.new(lrEndBar, tpsl1Low, bar_index, tpsl1Low, color=color.new(colorResistance, 30), width=2, style=line.style_dashed))
+    else
+        line.set_x1(array.get(tpsl1Lines, 0), lrEndBar)
+        line.set_y1(array.get(tpsl1Lines, 0), tpsl1High)
+        line.set_x2(array.get(tpsl1Lines, 0), bar_index)
+        line.set_y2(array.get(tpsl1Lines, 0), tpsl1High)
+        
+        line.set_x1(array.get(tpsl1Lines, 1), lrEndBar)
+        line.set_y1(array.get(tpsl1Lines, 1), tpsl1Low)
+        line.set_x2(array.get(tpsl1Lines, 1), bar_index)
+        line.set_y2(array.get(tpsl1Lines, 1), tpsl1Low)
+else
+    if array.size(tpsl1Lines) > 0
+        for i = 0 to array.size(tpsl1Lines) - 1
+            line.delete(array.get(tpsl1Lines, i))
+        array.clear(tpsl1Lines)
+
+// Draw TPSL 2 Lines
+if lrActive and showTPSL2 and not na(tpsl2High) and not na(tpsl2Low)
+    if array.size(tpsl2Lines) < 2
+        array.push(tpsl2Lines, line.new(lrEndBar, tpsl2High, bar_index, tpsl2High, color=color.new(colorSupport, 50), width=1, style=line.style_dotted))
+        array.push(tpsl2Lines, line.new(lrEndBar, tpsl2Low, bar_index, tpsl2Low, color=color.new(colorResistance, 50), width=1, style=line.style_dotted))
+    else
+        line.set_x1(array.get(tpsl2Lines, 0), lrEndBar)
+        line.set_y1(array.get(tpsl2Lines, 0), tpsl2High)
+        line.set_x2(array.get(tpsl2Lines, 0), bar_index)
+        line.set_y2(array.get(tpsl2Lines, 0), tpsl2High)
+        
+        line.set_x1(array.get(tpsl2Lines, 1), lrEndBar)
+        line.set_y1(array.get(tpsl2Lines, 1), tpsl2Low)
+        line.set_x2(array.get(tpsl2Lines, 1), bar_index)
+        line.set_y2(array.get(tpsl2Lines, 1), tpsl2Low)
+else
+    if array.size(tpsl2Lines) > 0
+        for i = 0 to array.size(tpsl2Lines) - 1
+            line.delete(array.get(tpsl2Lines, i))
+        array.clear(tpsl2Lines)
+
+// Imbalance direction arrows (per book - shows expected breakout direction)
+if lrActive and showImbalance
+    float y = na
+    string txt = ""
+    var st = label.style_label_down
+    bool showArrow = false
+
+    // Per book: Resistance LR (buyers trapped) → expect DOWN, Support LR (sellers trapped) → expect UP
+    if lrType == "Resistance" and math.abs(lrImbalance) * 100 >= minImbalancePct
+        y := lrLow - rangeHeight * 0.3
+        txt := "▼ Expected"
+        st := label.style_label_up
+        showArrow := true
+    else if lrType == "Support" and math.abs(lrImbalance) * 100 >= minImbalancePct
+        y := lrHigh + rangeHeight * 0.3
+        txt := "▲ Expected"
+        st := label.style_label_down
+        showArrow := true
+
+    if showArrow
+        if na(imbalanceLabel)
+            imbalanceLabel := label.new(bar_index, y, txt, color=color.new(lrColor, 20), textcolor=color.white, style=st, size=size.normal)
+        else
+            label.set_x(imbalanceLabel, bar_index)
+            label.set_y(imbalanceLabel, y)
+            label.set_text(imbalanceLabel, txt)
+            label.set_style(imbalanceLabel, st)
+            label.set_color(imbalanceLabel, color.new(lrColor, 20))
+    else
+        if not na(imbalanceLabel)
+            label.delete(imbalanceLabel)
+            imbalanceLabel := na
+
+// Breakout labels
+if showBreakoutLabels
+    if breakUp
+        label.new(bar_index, high, "▲ BREAKOUT UP", color=color.new(colorSupport, 0), textcolor=color.white, style=label.style_label_up, size=size.normal)
+    if breakDown
+        label.new(bar_index, low, "▼ BREAKOUT DOWN", color=color.new(colorResistance, 0), textcolor=color.white, style=label.style_label_down, size=size.normal)
+
+// Cancellation labels
+if showCancellation and lrJustCancelled
+    label.new(bar_index, close, "✗ LR CANCELLED\n(" + str.tostring(returnPct, "#") + "% return)", color=color.new(color.orange, 0), textcolor=color.white, style=label.style_label_center, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INFORMATION TABLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var table infoTable = table.new(position.top_right, 2, 12, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "LRA Enhanced Analysis", text_color=color.white, text_size=size.small)
+    table.merge_cells(infoTable, 0, 0, 1, 0)
+
+    table.cell(infoTable, 0, 1, "Current LR", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 1, lrActive ? lrType : "None", text_color=lrActive ? lrColor : color.white, text_size=size.tiny)
+
+    table.cell(infoTable, 0, 2, "Range", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 2, lrActive ? str.tostring(lrHigh, "#.####") + " - " + str.tostring(lrLow, "#.####") : "N/A", text_color=color.white, text_size=size.tiny)
+
+    table.cell(infoTable, 0, 3, "Imbalance", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 3, lrActive ? str.tostring(lrImbalance * 100, "#.#") + "%" : "N/A", text_color=lrActive ? lrColor : color.white, text_size=size.tiny)
+
+    table.cell(infoTable, 0, 4, "TOI Degree", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 4, lrActive ? lrVolDegree : "N/A", text_color=color.white, text_size=size.tiny)
+
+    table.cell(infoTable, 0, 5, "TPSL 1 High", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 5, lrActive and not na(tpsl1High) ? str.tostring(tpsl1High, "#.####") : "N/A", text_color=color.white, text_size=size.tiny)
+
+    table.cell(infoTable, 0, 6, "TPSL 1 Low", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 6, lrActive and not na(tpsl1Low) ? str.tostring(tpsl1Low, "#.####") : "N/A", text_color=color.white, text_size=size.tiny)
+
+    table.cell(infoTable, 0, 7, "TPSL 2 High", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 7, lrActive and not na(tpsl2High) ? str.tostring(tpsl2High, "#.####") : "N/A", text_color=color.white, text_size=size.tiny)
+
+    table.cell(infoTable, 0, 8, "TPSL 2 Low", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 8, lrActive and not na(tpsl2Low) ? str.tostring(tpsl2Low, "#.####") : "N/A", text_color=color.white, text_size=size.tiny)
+
+    table.cell(infoTable, 0, 9, "HTF Confirm", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 9, useMTF ? (htfIsConsolidating ? "✓ Consolidating" : "✗ Trending") : "Disabled", text_color=htfIsConsolidating ? color.green : color.red, text_size=size.tiny)
+
+    table.cell(infoTable, 0, 10, "Historical LRs", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 10, str.tostring(array.size(hist_lrHigh)), text_color=color.white, text_size=size.tiny)
+
+    table.cell(infoTable, 0, 11, "Timeframe", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 11, timeframe.period, text_color=color.white, text_size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(lrJustActivated and lrType == "Resistance", title="Resistance LR Detected", message="Resistance LR detected - Buyers trapped, expect DOWN move")
+alertcondition(lrJustActivated and lrType == "Support", title="Support LR Detected", message="Support LR detected - Sellers trapped, expect UP move")
+alertcondition(lrJustActivated and lrType == "Gravitation", title="Gravitation LR Detected", message="Gravitation LR detected - No significant imbalance")
+alertcondition(breakUp, title="Breakout Up", message="Price broke out ABOVE Locked Range")
+alertcondition(breakDown, title="Breakout Down", message="Price broke out BELOW Locked Range")
+alertcondition(lrJustCancelled, title="LR Cancelled", message="Locked Range cancelled due to price return")
+

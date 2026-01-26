@@ -1,0 +1,262 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © 2026 LRA Backtesting Strategy - Validates Locked Range Analysis Methodology
+
+//@version=6
+strategy("LRA Backtest Strategy", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=10, initial_capital=100000, commission_type=strategy.commission.percent, commission_value=0.05)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STRATEGY DESCRIPTION
+// ═══════════════════════════════════════════════════════════════════════════════
+// This strategy backtests the Locked Range Analysis (LRA) methodology from
+// Tom Leksey's book to validate:
+// 1. Range detection accuracy
+// 2. Imbalance-based direction prediction
+// 3. TPSL level effectiveness
+// 4. Win rate by range type (Resistance/Support/Gravitation)
+// 5. Volume degree (TOI) impact on outcomes
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUT PARAMETERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Range Detection Settings
+grpRange = "Range Detection"
+swingLength        = input.int(5, "Swing Length", minval=2, maxval=20, group=grpRange)
+rangeMinBars       = input.int(8, "Min Bars in Range", minval=3, maxval=50, group=grpRange)
+rangeMaxBars       = input.int(100, "Max Bars in Range", minval=20, maxval=300, group=grpRange)
+narrowMult         = input.float(0.8, "Narrow Range ATR Mult", minval=0.3, maxval=2.0, step=0.1, group=grpRange)
+touchThresholdPct  = input.float(10.0, "Touch Threshold %", minval=5.0, maxval=25.0, group=grpRange)
+
+// Imbalance Settings
+grpImbalance = "Imbalance Detection"
+minImbalancePct    = input.float(15.0, "Min Imbalance %", minval=5.0, maxval=30.0, group=grpImbalance)
+
+// Trade Settings
+grpTrade = "Trade Settings"
+tradeDirection     = input.string("Both", "Trade Direction", options=["Both", "Long Only", "Short Only"], group=grpTrade)
+useTPSL1           = input.bool(true, "Use TPSL1 for Targets", group=grpTrade)
+useTPSL2           = input.bool(false, "Use TPSL2 for Targets", group=grpTrade)
+stopBeyondRange    = input.float(50.0, "Stop Loss % Beyond Range", minval=10.0, maxval=200.0, group=grpTrade)
+entryMethod        = input.string("Breakout", "Entry Method", options=["Breakout", "Retest", "Immediate"], group=grpTrade)
+
+// Filter Settings
+grpFilter = "Filters"
+minTOI             = input.string("Any", "Minimum TOI", options=["Any", "Medium", "High"], group=grpFilter)
+onlyDirectional    = input.bool(false, "Only Trade Directional LR", group=grpFilter, tooltip="Skip Gravitation ranges")
+requireHTFConfirm  = input.bool(false, "Require HTF Confirmation", group=grpFilter)
+htfTimeframe       = input.timeframe("240", "HTF Timeframe", group=grpFilter)
+
+// Time Filter
+grpTime = "Time Filter"
+useTimeFilter      = input.bool(false, "Use Time Filter", group=grpTime)
+startHour          = input.int(8, "Start Hour (UTC)", minval=0, maxval=23, group=grpTime)
+endHour            = input.int(20, "End Hour (UTC)", minval=0, maxval=23, group=grpTime)
+
+// Visual Settings
+grpVisual = "Visuals"
+showRangeBoxes     = input.bool(true, "Show Range Boxes", group=grpVisual)
+showTPSLLines      = input.bool(true, "Show TPSL Lines", group=grpVisual)
+showTradeLabels    = input.bool(true, "Show Trade Labels", group=grpVisual)
+
+// Colors
+colorResistance    = color.new(color.red, 0)
+colorSupport       = color.new(color.green, 0)
+colorGravitation   = color.new(color.gray, 0)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CORE CALCULATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+atrVal = ta.atr(14)
+avgVolume = ta.sma(volume, 20)
+
+// Time filter
+currentHour = hour(time, "UTC")
+inTimeWindow = not useTimeFilter or (currentHour >= startHour and currentHour <= endHour)
+
+// HTF Data
+htfHigh = request.security(syminfo.tickerid, htfTimeframe, high)
+htfLow = request.security(syminfo.tickerid, htfTimeframe, low)
+htfAvgRange = request.security(syminfo.tickerid, htfTimeframe, ta.sma(high - low, 20))
+htfIsConsolidating = (htfHigh - htfLow) < htfAvgRange * 1.2
+
+// Swing detection for TPSL
+pivotHigh = ta.pivothigh(high, swingLength, swingLength)
+pivotLow = ta.pivotlow(low, swingLength, swingLength)
+
+var float[] swingHighs = array.new_float(50)
+var float[] swingLows = array.new_float(50)
+var int[] swingHighBars = array.new_int(50)
+var int[] swingLowBars = array.new_int(50)
+
+if not na(pivotHigh)
+    array.unshift(swingHighs, pivotHigh)
+    array.unshift(swingHighBars, bar_index - swingLength)
+    if array.size(swingHighs) > 30
+        array.pop(swingHighs)
+        array.pop(swingHighBars)
+
+if not na(pivotLow)
+    array.unshift(swingLows, pivotLow)
+    array.unshift(swingLowBars, bar_index - swingLength)
+    if array.size(swingLows) > 30
+        array.pop(swingLows)
+        array.pop(swingLowBars)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOCKED RANGE DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var float  lrHigh = na
+var float  lrLow = na
+var int    lrStartBar = na
+var bool   lrActive = false
+var string lrType = "Neutral"
+var float  lrImbalance = 0.0
+var string lrVolDegree = "Low"
+
+var int    rangeBarCount = 0
+var float  sumVolAtHigh = 0.0
+var float  sumVolAtLow = 0.0
+var int    touchesAtHigh = 0
+var int    touchesAtLow = 0
+var float  currentRangeTop = na
+var float  currentRangeBottom = na
+var int    currentRangeStart = na
+var float  totalRangeVolume = 0.0
+
+priceRange = high - low
+isNarrowRange = priceRange < atrVal * narrowMult
+
+// Detect ranges
+if not lrActive
+    htfOK = not requireHTFConfirm or htfIsConsolidating
+    
+    if isNarrowRange and htfOK
+        if na(currentRangeTop)
+            currentRangeTop := high
+            currentRangeBottom := low
+            currentRangeStart := bar_index
+            rangeBarCount := 1
+            touchesAtHigh := 0
+            touchesAtLow := 0
+            sumVolAtHigh := 0.0
+            sumVolAtLow := 0.0
+            totalRangeVolume := volume
+        else
+            currentRangeTop := math.max(currentRangeTop, high)
+            currentRangeBottom := math.min(currentRangeBottom, low)
+            rangeBarCount += 1
+            totalRangeVolume += volume
+
+            rangeHt = currentRangeTop - currentRangeBottom
+            touchThreshold = rangeHt * (touchThresholdPct / 100.0)
+
+            if high >= currentRangeTop - touchThreshold
+                touchesAtHigh += 1
+                sumVolAtHigh += volume
+            
+            if low <= currentRangeBottom + touchThreshold
+                touchesAtLow += 1
+                sumVolAtLow += volume
+
+        // Check if range qualifies
+        if rangeBarCount >= rangeMinBars and (touchesAtHigh > 0 or touchesAtLow > 0)
+            avgVolHigh = touchesAtHigh > 0 ? sumVolAtHigh / touchesAtHigh : 0.0
+            avgVolLow = touchesAtLow > 0 ? sumVolAtLow / touchesAtLow : 0.0
+            maxAvgVol = math.max(avgVolHigh, avgVolLow)
+            
+            rawImbalance = maxAvgVol > 0 ? (avgVolHigh - avgVolLow) / maxAvgVol : 0.0
+            
+            volRatio = totalRangeVolume / (avgVolume * rangeBarCount)
+            volDegree = volRatio > 1.5 ? "High" : volRatio > 0.8 ? "Medium" : "Low"
+            
+            absImbalance = math.abs(rawImbalance) * 100
+            
+            rangeType = "Gravitation"
+            if absImbalance >= minImbalancePct
+                rangeType := rawImbalance > 0 ? "Resistance" : "Support"
+            
+            // Activate LR
+            lrActive := true
+            lrHigh := currentRangeTop
+            lrLow := currentRangeBottom
+            lrStartBar := currentRangeStart
+            lrType := rangeType
+            lrImbalance := rawImbalance
+            lrVolDegree := volDegree
+
+            // Reset detection
+            currentRangeTop := na
+            currentRangeBottom := na
+            rangeBarCount := 0
+            sumVolAtHigh := 0.0
+            sumVolAtLow := 0.0
+            touchesAtHigh := 0
+            touchesAtLow := 0
+            totalRangeVolume := 0.0
+    else
+        currentRangeTop := na
+        currentRangeBottom := na
+        rangeBarCount := 0
+
+    if not na(currentRangeStart) and (bar_index - currentRangeStart) > rangeMaxBars
+        currentRangeTop := na
+        currentRangeBottom := na
+        rangeBarCount := 0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TPSL CALCULATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var float tpsl1High = na
+var float tpsl1Low = na
+var float tpsl2High = na
+var float tpsl2Low = na
+var float prevSwingHigh = na
+var float prevSwingLow = na
+
+if lrActive and lrActive != lrActive[1]
+    // Find swings before range
+    prevSwingHigh := na
+    prevSwingLow := na
+    
+    for i = 0 to math.min(array.size(swingHighs) - 1, 10)
+        if array.get(swingHighBars, i) < lrStartBar
+            prevSwingHigh := array.get(swingHighs, i)
+            break
+    
+    for i = 0 to math.min(array.size(swingLows) - 1, 10)
+        if array.get(swingLowBars, i) < lrStartBar
+            prevSwingLow := array.get(swingLows, i)
+            break
+
+if lrActive
+    rangeHeight = lrHigh - lrLow
+    
+    // TPSL1
+    tpsl1High := not na(prevSwingHigh) and prevSwingHigh > lrHigh ? prevSwingHigh : lrHigh + rangeHeight
+    tpsl1Low := not na(prevSwingLow) and prevSwingLow < lrLow ? prevSwingLow : lrLow - rangeHeight
+    
+    // TPSL2
+    tpsl2High := tpsl1High + rangeHeight * 0.5
+    tpsl2Low := tpsl1Low - rangeHeight * 0.5
+else
+    tpsl1High := na
+    tpsl1Low := na
+    tpsl2High := na
+    tpsl2Low := na
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BREAKOUT DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+rangeHeight = lrActive ? (lrHigh - lrLow) : na
+breakThreshold = lrActive ? rangeHeight * 0.005 : na
+
+breakUpConfirm = lrActive and close > (lrHigh + breakThreshold)
+breakDownConfirm = lrActive and close < (lrLow - breakThreshold)
+
+bool breakUp = breakUpConfirm and not breakUpConfirm[1]
+bool breakDown = breakDownConfirm and not breakDownConfirm[1]
+
