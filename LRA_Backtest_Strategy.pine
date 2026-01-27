@@ -260,3 +260,398 @@ breakDownConfirm = lrActive and close < (lrLow - breakThreshold)
 bool breakUp = breakUpConfirm and not breakUpConfirm[1]
 bool breakDown = breakDownConfirm and not breakDownConfirm[1]
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATISTICS TRACKING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Track trades by type
+var int totalRanges = 0
+var int resistanceRanges = 0
+var int supportRanges = 0
+var int gravitationRanges = 0
+
+var int resistanceCorrect = 0  // Broke down as expected
+var int supportCorrect = 0     // Broke up as expected
+var int gravitationBreakUp = 0
+var int gravitationBreakDown = 0
+
+var int highTOITrades = 0
+var int highTOIWins = 0
+var int mediumTOITrades = 0
+var int mediumTOIWins = 0
+var int lowTOITrades = 0
+var int lowTOIWins = 0
+
+var int tpsl1Hits = 0
+var int tpsl2Hits = 0
+var int stopHits = 0
+
+// Store last trade info for win tracking
+var string lastTradeType = ""
+var string lastTradeTOI = ""
+var float lastEntryPrice = na
+var float lastTP1 = na
+var float lastTP2 = na
+var float lastSL = na
+var bool lastTradeOpen = false
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRADING LOGIC
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Check filters
+toiOK = minTOI == "Any" or (minTOI == "Medium" and (lrVolDegree == "Medium" or lrVolDegree == "High")) or (minTOI == "High" and lrVolDegree == "High")
+directionalOK = not onlyDirectional or lrType != "Gravitation"
+canTrade = inTimeWindow and toiOK and directionalOK
+
+// Entry signals based on book methodology
+// Resistance LR (buyers trapped) → Expect DOWN → Short on breakout down
+// Support LR (sellers trapped) → Expect UP → Long on breakout up
+
+bool goLong = false
+bool goShort = false
+float entryPrice = na
+float takeProfit = na
+float stopLoss = na
+
+if canTrade and lrActive
+    rh = lrHigh - lrLow
+    
+    if entryMethod == "Breakout"
+        // Per book: Trade in direction of breakout, validated by LR type
+        if breakUp and (tradeDirection == "Both" or tradeDirection == "Long Only")
+            goLong := true
+            entryPrice := close
+            takeProfit := useTPSL2 ? tpsl2High : tpsl1High
+            stopLoss := lrLow - rh * (stopBeyondRange / 100.0)
+            
+        if breakDown and (tradeDirection == "Both" or tradeDirection == "Short Only")
+            goShort := true
+            entryPrice := close
+            takeProfit := useTPSL2 ? tpsl2Low : tpsl1Low
+            stopLoss := lrHigh + rh * (stopBeyondRange / 100.0)
+            
+    else if entryMethod == "Immediate"
+        // Enter immediately when LR is detected based on type
+        if lrType == "Support" and lrActive != lrActive[1] and (tradeDirection == "Both" or tradeDirection == "Long Only")
+            goLong := true
+            entryPrice := close
+            takeProfit := useTPSL2 ? tpsl2High : tpsl1High
+            stopLoss := lrLow - rh * (stopBeyondRange / 100.0)
+            
+        if lrType == "Resistance" and lrActive != lrActive[1] and (tradeDirection == "Both" or tradeDirection == "Short Only")
+            goShort := true
+            entryPrice := close
+            takeProfit := useTPSL2 ? tpsl2Low : tpsl1Low
+            stopLoss := lrHigh + rh * (stopBeyondRange / 100.0)
+
+// Track breakout statistics (regardless of trade)
+if breakUp and lrActive[1]
+    totalRanges += 1
+    if lrType[1] == "Resistance"
+        resistanceRanges += 1
+        // Resistance broke UP - incorrect per book
+    else if lrType[1] == "Support"
+        supportRanges += 1
+        supportCorrect += 1  // Support broke UP - correct per book
+    else
+        gravitationRanges += 1
+        gravitationBreakUp += 1
+
+if breakDown and lrActive[1]
+    totalRanges += 1
+    if lrType[1] == "Resistance"
+        resistanceRanges += 1
+        resistanceCorrect += 1  // Resistance broke DOWN - correct per book
+    else if lrType[1] == "Support"
+        supportRanges += 1
+        // Support broke DOWN - incorrect per book
+    else
+        gravitationRanges += 1
+        gravitationBreakDown += 1
+
+// Execute trades
+if goLong and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", limit=takeProfit, stop=stopLoss)
+    lastTradeType := lrType
+    lastTradeTOI := lrVolDegree
+    lastEntryPrice := entryPrice
+    lastTP1 := tpsl1High
+    lastTP2 := tpsl2High
+    lastSL := stopLoss
+    lastTradeOpen := true
+    
+    // Track TOI stats
+    if lrVolDegree == "High"
+        highTOITrades += 1
+    else if lrVolDegree == "Medium"
+        mediumTOITrades += 1
+    else
+        lowTOITrades += 1
+
+if goShort and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", limit=takeProfit, stop=stopLoss)
+    lastTradeType := lrType
+    lastTradeTOI := lrVolDegree
+    lastEntryPrice := entryPrice
+    lastTP1 := tpsl1Low
+    lastTP2 := tpsl2Low
+    lastSL := stopLoss
+    lastTradeOpen := true
+    
+    if lrVolDegree == "High"
+        highTOITrades += 1
+    else if lrVolDegree == "Medium"
+        mediumTOITrades += 1
+    else
+        lowTOITrades += 1
+
+// Track exits for TPSL statistics
+if lastTradeOpen and strategy.position_size == 0
+    // Position just closed
+    wasWin = strategy.netprofit > strategy.netprofit[1]
+    
+    if wasWin
+        if lastTradeTOI == "High"
+            highTOIWins += 1
+        else if lastTradeTOI == "Medium"
+            mediumTOIWins += 1
+        else
+            lowTOIWins += 1
+    
+    lastTradeOpen := false
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VISUALIZATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Get color based on type
+getLrColor(lrT) =>
+    lrT == "Resistance" ? colorResistance : lrT == "Support" ? colorSupport : colorGravitation
+
+// Current active box/lines (will be redrawn each bar)
+var box currentBox = na
+var line currentTPSL1High = na
+var line currentTPSL1Low = na
+
+// *** HISTORICAL BOXES - Draw BEFORE resetting LR values ***
+// Detect breakout while LR is still active
+bool drawHistoricalBox = showRangeBoxes and (breakUp or breakDown) and lrActive and not na(lrStartBar) and not na(lrHigh) and not na(lrLow)
+
+// Save values before reset
+float histHigh = lrHigh
+float histLow = lrLow  
+int histStart = lrStartBar
+string histType = lrType
+string histTOI = lrVolDegree
+bool histBreakUp = breakUp
+
+// Draw historical box if breakout detected
+if drawHistoricalBox
+    histColor = getLrColor(histType)
+    
+    // Draw the completed range box
+    box.new(
+        left = histStart,
+        top = histHigh,
+        right = bar_index,
+        bottom = histLow,
+        bgcolor = color.new(histColor, 70),
+        border_color = histColor,
+        border_width = 3,
+        border_style = line.style_solid,
+        extend = extend.none
+    )
+    
+    // Add label showing range type, TOI, and breakout direction
+    breakDirStr = histBreakUp ? " ▲ UP" : " ▼ DOWN"
+    lblText = histType + "\nTOI: " + histTOI + breakDirStr
+    label.new(
+        x = histStart,
+        y = histHigh,
+        text = lblText,
+        color = color.new(histColor, 30),
+        textcolor = color.white,
+        style = label.style_label_down,
+        size = size.small
+    )
+    
+    // Delete current active box since range is now complete
+    if not na(currentBox)
+        box.delete(currentBox)
+        currentBox := na
+    if not na(currentTPSL1High)
+        line.delete(currentTPSL1High)
+        line.delete(currentTPSL1Low)
+        currentTPSL1High := na
+        currentTPSL1Low := na
+
+// Reset LR after breakout (AFTER drawing historical box)
+if breakUp or breakDown
+    lrActive := false
+    lrHigh := na
+    lrLow := na
+    lrType := "Neutral"
+
+// *** CURRENT ACTIVE RANGE BOX ***
+lrColor = getLrColor(lrType)
+
+// Delete old current box first (only if not already deleted above)
+if not na(currentBox) and not drawHistoricalBox
+    box.delete(currentBox)
+    currentBox := na
+
+// Draw new current box if active
+if showRangeBoxes and lrActive and not na(lrHigh) and not na(lrLow) and not na(lrStartBar)
+    currentBox := box.new(
+        left = lrStartBar,
+        top = lrHigh,
+        right = bar_index,
+        bottom = lrLow,
+        bgcolor = color.new(lrColor, 85),
+        border_color = lrColor,
+        border_width = 2,
+        border_style = line.style_dashed
+    )
+
+// *** TPSL LINES ***
+// Delete old lines first (only if not already deleted above)
+if not na(currentTPSL1High) and not drawHistoricalBox
+    line.delete(currentTPSL1High)
+    line.delete(currentTPSL1Low)
+    currentTPSL1High := na
+    currentTPSL1Low := na
+
+// Draw new TPSL lines if active
+if showTPSLLines and lrActive and not na(tpsl1High) and not na(tpsl1Low) and not na(lrStartBar)
+    currentTPSL1High := line.new(lrStartBar, tpsl1High, bar_index, tpsl1High, 
+        color=color.new(color.green, 40), style=line.style_dashed, width=2)
+    currentTPSL1Low := line.new(lrStartBar, tpsl1Low, bar_index, tpsl1Low, 
+        color=color.new(color.red, 40), style=line.style_dashed, width=2)
+
+// *** TRADE LABELS ***
+if showTradeLabels
+    if goLong
+        label.new(bar_index, low, "▲ LONG\n" + lrType + "\nTOI: " + lrVolDegree, 
+            color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small)
+    if goShort
+        label.new(bar_index, high, "▼ SHORT\n" + lrType + "\nTOI: " + lrVolDegree, 
+            color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+
+// *** DEBUG: Plot when LR is active and when breakout occurs ***
+plotshape(lrActive and lrActive != lrActive[1], title="LR Activated", location=location.bottom, 
+    color=color.blue, style=shape.circle, size=size.tiny)
+plotshape(breakUp, title="Breakout Up", location=location.belowbar, 
+    color=color.green, style=shape.triangleup, size=size.small)
+plotshape(breakDown, title="Breakout Down", location=location.abovebar, 
+    color=color.red, style=shape.triangledown, size=size.small)
+plotshape(drawHistoricalBox, title="Box Drawn", location=location.top, 
+    color=color.yellow, style=shape.diamond, size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATISTICS TABLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var table statsTable = table.new(position.top_right, 2, 20, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast
+    // Header
+    table.cell(statsTable, 0, 0, "LRA BACKTEST STATISTICS", text_color=color.white, text_size=size.normal)
+    table.merge_cells(statsTable, 0, 0, 1, 0)
+    
+    // Range Statistics
+    table.cell(statsTable, 0, 1, "═══ RANGE DETECTION ═══", text_color=color.yellow, text_size=size.tiny)
+    table.merge_cells(statsTable, 0, 1, 1, 1)
+    
+    table.cell(statsTable, 0, 2, "Total Ranges:", text_color=color.gray, text_size=size.tiny)
+    table.cell(statsTable, 1, 2, str.tostring(totalRanges), text_color=color.white, text_size=size.tiny)
+    
+    table.cell(statsTable, 0, 3, "Resistance LRs:", text_color=color.gray, text_size=size.tiny)
+    table.cell(statsTable, 1, 3, str.tostring(resistanceRanges), text_color=colorResistance, text_size=size.tiny)
+    
+    table.cell(statsTable, 0, 4, "Support LRs:", text_color=color.gray, text_size=size.tiny)
+    table.cell(statsTable, 1, 4, str.tostring(supportRanges), text_color=colorSupport, text_size=size.tiny)
+    
+    table.cell(statsTable, 0, 5, "Gravitation LRs:", text_color=color.gray, text_size=size.tiny)
+    table.cell(statsTable, 1, 5, str.tostring(gravitationRanges), text_color=colorGravitation, text_size=size.tiny)
+    
+    // Prediction Accuracy
+    table.cell(statsTable, 0, 6, "═══ PREDICTION ACCURACY ═══", text_color=color.yellow, text_size=size.tiny)
+    table.merge_cells(statsTable, 0, 6, 1, 6)
+    
+    resistanceAccuracy = resistanceRanges > 0 ? (resistanceCorrect / resistanceRanges) * 100 : 0
+    table.cell(statsTable, 0, 7, "Resistance Correct:", text_color=color.gray, text_size=size.tiny)
+    table.cell(statsTable, 1, 7, str.tostring(resistanceCorrect) + "/" + str.tostring(resistanceRanges) + " (" + str.tostring(resistanceAccuracy, "#.#") + "%)", text_color=resistanceAccuracy >= 50 ? color.green : color.red, text_size=size.tiny)
+    
+    supportAccuracy = supportRanges > 0 ? (supportCorrect / supportRanges) * 100 : 0
+    table.cell(statsTable, 0, 8, "Support Correct:", text_color=color.gray, text_size=size.tiny)
+    table.cell(statsTable, 1, 8, str.tostring(supportCorrect) + "/" + str.tostring(supportRanges) + " (" + str.tostring(supportAccuracy, "#.#") + "%)", text_color=supportAccuracy >= 50 ? color.green : color.red, text_size=size.tiny)
+    
+    overallAccuracy = (resistanceRanges + supportRanges) > 0 ? ((resistanceCorrect + supportCorrect) / (resistanceRanges + supportRanges)) * 100 : 0
+    table.cell(statsTable, 0, 9, "Overall Directional:", text_color=color.gray, text_size=size.tiny)
+    table.cell(statsTable, 1, 9, str.tostring(overallAccuracy, "#.#") + "%", text_color=overallAccuracy >= 50 ? color.green : color.red, text_size=size.tiny)
+    
+    // TOI Analysis
+    table.cell(statsTable, 0, 10, "═══ TOI ANALYSIS ═══", text_color=color.yellow, text_size=size.tiny)
+    table.merge_cells(statsTable, 0, 10, 1, 10)
+    
+    highTOIWinRate = highTOITrades > 0 ? (highTOIWins / highTOITrades) * 100 : 0
+    table.cell(statsTable, 0, 11, "High TOI Win Rate:", text_color=color.gray, text_size=size.tiny)
+    table.cell(statsTable, 1, 11, str.tostring(highTOIWins) + "/" + str.tostring(highTOITrades) + " (" + str.tostring(highTOIWinRate, "#.#") + "%)", text_color=color.white, text_size=size.tiny)
+    
+    mediumTOIWinRate = mediumTOITrades > 0 ? (mediumTOIWins / mediumTOITrades) * 100 : 0
+    table.cell(statsTable, 0, 12, "Medium TOI Win Rate:", text_color=color.gray, text_size=size.tiny)
+    table.cell(statsTable, 1, 12, str.tostring(mediumTOIWins) + "/" + str.tostring(mediumTOITrades) + " (" + str.tostring(mediumTOIWinRate, "#.#") + "%)", text_color=color.white, text_size=size.tiny)
+    
+    lowTOIWinRate = lowTOITrades > 0 ? (lowTOIWins / lowTOITrades) * 100 : 0
+    table.cell(statsTable, 0, 13, "Low TOI Win Rate:", text_color=color.gray, text_size=size.tiny)
+    table.cell(statsTable, 1, 13, str.tostring(lowTOIWins) + "/" + str.tostring(lowTOITrades) + " (" + str.tostring(lowTOIWinRate, "#.#") + "%)", text_color=color.white, text_size=size.tiny)
+    
+    // Strategy Performance
+    table.cell(statsTable, 0, 14, "═══ STRATEGY STATS ═══", text_color=color.yellow, text_size=size.tiny)
+    table.merge_cells(statsTable, 0, 14, 1, 14)
+    
+    table.cell(statsTable, 0, 15, "Net Profit:", text_color=color.gray, text_size=size.tiny)
+    table.cell(statsTable, 1, 15, str.tostring(strategy.netprofit, "#.##"), text_color=strategy.netprofit >= 0 ? color.green : color.red, text_size=size.tiny)
+    
+    table.cell(statsTable, 0, 16, "Win Rate:", text_color=color.gray, text_size=size.tiny)
+    winRate = strategy.closedtrades > 0 ? (strategy.wintrades / strategy.closedtrades) * 100 : 0
+    table.cell(statsTable, 1, 16, str.tostring(winRate, "#.#") + "%", text_color=winRate >= 50 ? color.green : color.red, text_size=size.tiny)
+    
+    table.cell(statsTable, 0, 17, "Profit Factor:", text_color=color.gray, text_size=size.tiny)
+    table.cell(statsTable, 1, 17, str.tostring(strategy.grossprofit / math.max(strategy.grossloss, 1), "#.##"), text_color=color.white, text_size=size.tiny)
+    
+    table.cell(statsTable, 0, 18, "Total Trades:", text_color=color.gray, text_size=size.tiny)
+    table.cell(statsTable, 1, 18, str.tostring(strategy.closedtrades), text_color=color.white, text_size=size.tiny)
+    
+    table.cell(statsTable, 0, 19, "Max Drawdown:", text_color=color.gray, text_size=size.tiny)
+    table.cell(statsTable, 1, 19, str.tostring(strategy.max_drawdown, "#.##"), text_color=color.red, text_size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Note: alertcondition requires const strings, so we create separate alerts for each type
+// Use alert() for dynamic messages in real-time
+
+// Static alert conditions
+alertcondition(goLong, title="Long Signal", message="LRA Long Signal Triggered")
+alertcondition(goShort, title="Short Signal", message="LRA Short Signal Triggered")
+alertcondition(breakUp, title="Breakout Up", message="LRA Breakout Up")
+alertcondition(breakDown, title="Breakout Down", message="LRA Breakout Down")
+
+// Specific type alerts
+alertcondition(goLong and lrType == "Support", title="Long - Support LR", message="LRA Long from Support LR")
+alertcondition(goShort and lrType == "Resistance", title="Short - Resistance LR", message="LRA Short from Resistance LR")
+alertcondition(goLong and lrVolDegree == "High", title="Long - High TOI", message="LRA Long with High TOI")
+alertcondition(goShort and lrVolDegree == "High", title="Short - High TOI", message="LRA Short with High TOI")
+
+// Dynamic alerts using alert() function (fires in real-time, not for alert conditions)
+if goLong
+    alert("LRA LONG: " + syminfo.ticker + " | Type: " + lrType + " | TOI: " + lrVolDegree + " | Entry: " + str.tostring(close), alert.freq_once_per_bar_close)
+
+if goShort
+    alert("LRA SHORT: " + syminfo.ticker + " | Type: " + lrType + " | TOI: " + lrVolDegree + " | Entry: " + str.tostring(close), alert.freq_once_per_bar_close)
+
